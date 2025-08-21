@@ -23,7 +23,6 @@ from tkinter import filedialog, ttk
 import threading
 import os
 import sys
-###################################################################################################
 
 def extract_audio(video_path):
     video = mp.VideoFileClip(video_path)
