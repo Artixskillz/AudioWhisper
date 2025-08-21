@@ -1,10 +1,29 @@
+import subprocess
 import sys
-import os
+
+def install_package(package):
+    subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+
+try:
+    import moviepy.editor as mp
+except ImportError:
+    print("moviepy not found. Installing...")
+    install_package("moviepy")
+    import moviepy.editor as mp
+
+try:
+    import whisper
+except ImportError:
+    print("whisper not found. Installing...")
+    install_package("whisper")
+    import whisper
+
 import tkinter as tk
 from tkinter import filedialog, ttk
 import threading
-import whisper
-import moviepy.editor as mp
+import os
+import sys
+###################################################################################################
 
 def extract_audio(video_path):
     video = mp.VideoFileClip(video_path)
