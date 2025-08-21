@@ -1,3 +1,20 @@
+import sys
+import subprocess
+import importlib
+
+# list of required packages
+REQUIRED_PACKAGES = ["openai-whisper", "ffmpeg-python"]
+
+def install(package):
+    subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+
+for package in REQUIRED_PACKAGES:
+    try:
+        importlib.import_module(package.split("-")[0])  # crude check
+    except ImportError:
+        print(f"Installing missing package: {package}")
+        install(package)
+
 import os
 import threading
 import tkinter as tk
