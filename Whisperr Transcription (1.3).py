@@ -86,7 +86,7 @@ def execute_whisper(input_path, output_dir, model_name, show_timestamps):
         num_chunks = math.ceil(duration / chunk_length)
 
         # Prepare output filename (with auto-increment)
-        output_filename = "Extracted Audio.txt"
+        output_filename = "Transcription.txt"
         output_path = os.path.join(output_dir, output_filename)
         output_path = get_unique_filename(output_path)
 
