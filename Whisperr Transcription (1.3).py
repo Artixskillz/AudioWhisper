@@ -44,6 +44,20 @@ def extract_audio(video_path, output_path):
         raise RuntimeError(f"FFmpeg failed: {e}")
 
 
+def get_unique_filename(base_path):
+    """Ensure output file does not overwrite existing ones by adding (2), (3), etc."""
+    if not os.path.exists(base_path):
+        return base_path
+    
+    base, ext = os.path.splitext(base_path)
+    counter = 2
+    new_path = f"{base} ({counter}){ext}"
+    while os.path.exists(new_path):
+        counter += 1
+        new_path = f"{base} ({counter}){ext}"
+    return new_path
+
+
 def execute_whisper(input_path, output_dir, model_name, show_timestamps):
     """Run Whisper transcription and save result."""
     log_message(f"Loading Whisper model: {model_name}...")
@@ -59,22 +73,28 @@ def execute_whisper(input_path, output_dir, model_name, show_timestamps):
             input_path = temp_audio_path
             log_message("Audio extracted. Starting transcription...")
 
-        # Transcribe
-        log_message("Transcribing... this may take a while.")
-        result = model.transcribe(input_path, verbose=True)
-
-        # Save result
+        # Prepare output filename
         output_filename = "Extracted Audio.txt"
         output_path = os.path.join(output_dir, output_filename)
+        output_path = get_unique_filename(output_path)
+
+        # Transcribe
+        log_message("Transcribing... this may take a while.")
+        result = model.transcribe(input_path, verbose=False)
 
         with open(output_path, "w", encoding="utf-8") as f:
             if show_timestamps:
                 for seg in result["segments"]:
                     start = seg["start"]
                     timestamp = f"[{int(start//3600):02}:{int((start%3600)//60):02}:{int(start%60):02}]"
-                    f.write(f"{timestamp} {seg['text'].strip()}\n")
+                    line = f"{timestamp} {seg['text'].strip()}"
+                    log_message(line)   # stream to GUI
+                    f.write(line + "\n")
             else:
-                f.write(result["text"])
+                for seg in result["segments"]:
+                    line = seg["text"].strip()
+                    log_message(line)   # stream to GUI
+                    f.write(line + " ")
 
         log_message(f"✅ Transcription saved: {output_path}")
     finally:
@@ -113,7 +133,7 @@ def start_transcription():
 
 # ---------------- GUI ---------------- #
 root = tk.Tk()
-root.title("Whisper Transcription Tool (v1.4)")
+root.title("Whisper Transcription Tool (v1.5)")
 
 input_frame = ttk.Frame(root, padding="10")
 input_frame.grid(row=0, column=0, sticky=(tk.W, tk.E))
@@ -151,7 +171,7 @@ progress_bar.grid(row=5, column=0, columnspan=3, pady=5)
 status_var = tk.StringVar()
 ttk.Label(input_frame, textvariable=status_var, wraplength=400).grid(row=6, column=0, columnspan=3, pady=5)
 
-log_box = scrolledtext.ScrolledText(input_frame, width=60, height=10, wrap=tk.WORD)
+log_box = scrolledtext.ScrolledText(input_frame, width=60, height=15, wrap=tk.WORD)
 log_box.grid(row=7, column=0, columnspan=3, pady=5)
 
 root.mainloop()
