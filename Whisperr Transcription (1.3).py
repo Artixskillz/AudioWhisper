@@ -82,7 +82,7 @@ def execute_whisper(input_path, output_dir, model_name, show_timestamps):
         # Load audio
         audio, sr = librosa.load(input_path, sr=16000)
         duration = librosa.get_duration(y=audio, sr=sr)
-        chunk_length = 5  # seconds
+        chunk_length = 10  # seconds
         num_chunks = math.ceil(duration / chunk_length)
 
         # Prepare output filename (with auto-increment)
