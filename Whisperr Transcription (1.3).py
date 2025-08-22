@@ -3,11 +3,12 @@ import subprocess
 import importlib
 import os
 import threading
+import time
 import tkinter as tk
 from tkinter import filedialog, ttk, messagebox, scrolledtext
 
 # auto-install required packages
-REQUIRED_PACKAGES = ["openai-whisper", "ffmpeg-python"]
+REQUIRED_PACKAGES = ["openai-whisper", "ffmpeg-python", "librosa", "soundfile"]
 
 def install(package):
     subprocess.check_call([sys.executable, "-m", "pip", "install", package])
@@ -21,6 +22,10 @@ for package in REQUIRED_PACKAGES:
 
 import whisper
 import ffmpeg
+import librosa
+import soundfile as sf
+import math
+import tempfile
 
 
 def log_message(msg):
@@ -59,11 +64,12 @@ def get_unique_filename(base_path):
 
 
 def execute_whisper(input_path, output_dir, model_name, show_timestamps):
-    """Run Whisper transcription and save result."""
+    """Run Whisper transcription in 5s chunks and stream results into the GUI log."""
     log_message(f"Loading Whisper model: {model_name}...")
     model = whisper.load_model(model_name)
 
     temp_audio_path = None
+    start_time = time.time()
     try:
         # If input is a video, extract audio
         if input_path.lower().endswith(('.mp4', '.avi', '.mov', '.mkv')):
@@ -73,30 +79,53 @@ def execute_whisper(input_path, output_dir, model_name, show_timestamps):
             input_path = temp_audio_path
             log_message("Audio extracted. Starting transcription...")
 
-        # Prepare output filename
+        # Load audio
+        audio, sr = librosa.load(input_path, sr=16000)
+        duration = librosa.get_duration(y=audio, sr=sr)
+        chunk_length = 5  # seconds
+        num_chunks = math.ceil(duration / chunk_length)
+
+        # Prepare output filename (with auto-increment)
         output_filename = "Extracted Audio.txt"
         output_path = os.path.join(output_dir, output_filename)
         output_path = get_unique_filename(output_path)
 
-        # Transcribe
-        log_message("Transcribing... this may take a while.")
-        result = model.transcribe(input_path, verbose=False)
-
         with open(output_path, "w", encoding="utf-8") as f:
-            if show_timestamps:
-                for seg in result["segments"]:
-                    start = seg["start"]
-                    timestamp = f"[{int(start//3600):02}:{int((start%3600)//60):02}:{int(start%60):02}]"
-                    line = f"{timestamp} {seg['text'].strip()}"
-                    log_message(line)   # stream to GUI
-                    f.write(line + "\n")
-            else:
-                for seg in result["segments"]:
-                    line = seg["text"].strip()
-                    log_message(line)   # stream to GUI
-                    f.write(line + " ")
+            for i in range(num_chunks):
+                start = i * chunk_length
+                end = min((i+1) * chunk_length, duration)
 
+                # Slice audio for this chunk
+                chunk_audio = audio[int(start*sr):int(end*sr)]
+                temp_chunk = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+                sf.write(temp_chunk.name, chunk_audio, sr)
+
+                # Transcribe chunk
+                log_message(f"🔊 Transcribing chunk {i+1}/{num_chunks} ({start:.1f}s–{end:.1f}s)...")
+                result = model.transcribe(temp_chunk.name, verbose=False)
+
+                # Stream results into GUI + save
+                if show_timestamps:
+                    for seg in result["segments"]:
+                        seg_start = seg["start"] + start
+                        timestamp = f"[{int(seg_start//3600):02}:{int((seg_start%3600)//60):02}:{int(seg_start%60):02}]"
+                        line = f"{timestamp} {seg['text'].strip()}"
+                        log_message(line)
+                        f.write(line + "\n")
+                else:
+                    text = result["text"].strip()
+                    log_message(text)
+                    f.write(text + " ")
+
+                # cleanup chunk file
+                temp_chunk.close()
+                os.remove(temp_chunk.name)
+
+        elapsed = time.time() - start_time
+        mins, secs = divmod(int(elapsed), 60)
         log_message(f"✅ Transcription saved: {output_path}")
+        log_message(f"⏱ Finished in {mins}m {secs}s")
+
     finally:
         if temp_audio_path and os.path.exists(temp_audio_path):
             os.remove(temp_audio_path)
@@ -133,7 +162,7 @@ def start_transcription():
 
 # ---------------- GUI ---------------- #
 root = tk.Tk()
-root.title("Whisper Transcription Tool (v1.5)")
+root.title("Whisper Transcription Tool (v1.6)")
 
 input_frame = ttk.Frame(root, padding="10")
 input_frame.grid(row=0, column=0, sticky=(tk.W, tk.E))
