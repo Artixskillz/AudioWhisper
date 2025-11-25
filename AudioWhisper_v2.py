@@ -1,0 +1,292 @@
+import sys
+import subprocess
+import importlib
+import os
+import threading
+import time
+import queue
+import tkinter as tk
+from tkinter import filedialog, messagebox
+
+# ---------------- Auto-Install Prerequisites ---------------- #
+REQUIRED_PACKAGES = [
+    "customtkinter",
+    "openai-whisper",
+    "ffmpeg-python",
+    "librosa",
+    "soundfile",
+    "packaging"
+]
+
+def install_package(package):
+    """Install a package using pip."""
+    try:
+        print(f"Installing missing package: {package}...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+    except subprocess.CalledProcessError as e:
+        print(f"Failed to install {package}: {e}")
+        sys.exit(1)
+
+def check_and_install_packages():
+    """Check if required packages are installed and install them if missing."""
+    for package in REQUIRED_PACKAGES:
+        try:
+            # Handle package names that differ from import names
+            import_name = package
+            if package == "openai-whisper":
+                import_name = "whisper"
+            elif package == "ffmpeg-python":
+                import_name = "ffmpeg"
+            elif package == "customtkinter":
+                import_name = "customtkinter"
+            
+            importlib.import_module(import_name)
+        except ImportError:
+            install_package(package)
+
+# Run installation check before importing
+check_and_install_packages()
+
+# ---------------- Imports ---------------- #
+import customtkinter as ctk
+import whisper
+import ffmpeg
+import librosa
+import soundfile as sf
+
+# ---------------- Configuration ---------------- #
+ctk.set_appearance_mode("System")  # Modes: "System" (standard), "Dark", "Light"
+ctk.set_default_color_theme("blue")  # Themes: "blue" (standard), "green", "dark-blue"
+
+class AudioWhisperApp(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+
+        # Window Setup
+        self.title("AudioWhisper v2.0")
+        self.geometry("700x600")
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(4, weight=1)  # Log box expands
+
+        # State Variables
+        self.input_path = ctk.StringVar()
+        self.output_dir = ctk.StringVar()
+        self.model_name = ctk.StringVar(value="base")
+        self.show_timestamps = ctk.BooleanVar(value=False)
+        self.status_msg = ctk.StringVar(value="Ready")
+        self.is_transcribing = False
+        self.stop_event = threading.Event()
+        self.log_queue = queue.Queue()
+
+        # UI Layout
+        self.create_widgets()
+        
+        # Start Log Polling
+        self.check_log_queue()
+
+    def create_widgets(self):
+        # --- Input File ---
+        self.input_frame = ctk.CTkFrame(self)
+        self.input_frame.grid(row=0, column=0, padx=20, pady=(20, 10), sticky="ew")
+        self.input_frame.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(self.input_frame, text="Input File:").grid(row=0, column=0, padx=10, pady=10)
+        ctk.CTkEntry(self.input_frame, textvariable=self.input_path).grid(row=0, column=1, padx=10, pady=10, sticky="ew")
+        ctk.CTkButton(self.input_frame, text="Browse", width=80, command=self.browse_input).grid(row=0, column=2, padx=10, pady=10)
+
+        # --- Output Directory ---
+        self.output_frame = ctk.CTkFrame(self)
+        self.output_frame.grid(row=1, column=0, padx=20, pady=10, sticky="ew")
+        self.output_frame.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(self.output_frame, text="Output Dir:").grid(row=0, column=0, padx=10, pady=10)
+        ctk.CTkEntry(self.output_frame, textvariable=self.output_dir).grid(row=0, column=1, padx=10, pady=10, sticky="ew")
+        ctk.CTkButton(self.output_frame, text="Browse", width=80, command=self.browse_output).grid(row=0, column=2, padx=10, pady=10)
+
+        # --- Settings ---
+        self.settings_frame = ctk.CTkFrame(self)
+        self.settings_frame.grid(row=2, column=0, padx=20, pady=10, sticky="ew")
+        
+        ctk.CTkLabel(self.settings_frame, text="Model:").grid(row=0, column=0, padx=10, pady=10)
+        self.model_combo = ctk.CTkComboBox(self.settings_frame, values=["tiny", "base", "small", "medium", "large"], variable=self.model_name)
+        self.model_combo.grid(row=0, column=1, padx=10, pady=10)
+
+        self.timestamp_switch = ctk.CTkSwitch(self.settings_frame, text="Show Timestamps", variable=self.show_timestamps)
+        self.timestamp_switch.grid(row=0, column=2, padx=20, pady=10)
+
+        # --- Controls ---
+        self.controls_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.controls_frame.grid(row=3, column=0, padx=20, pady=10, sticky="ew")
+        self.controls_frame.grid_columnconfigure((0, 1), weight=1)
+
+        self.start_btn = ctk.CTkButton(self.controls_frame, text="Start Transcription", fg_color="green", hover_color="darkgreen", command=self.start_transcription)
+        self.start_btn.grid(row=0, column=0, padx=10, pady=10, sticky="ew")
+
+        self.stop_btn = ctk.CTkButton(self.controls_frame, text="Stop", fg_color="red", hover_color="darkred", state="disabled", command=self.stop_transcription)
+        self.stop_btn.grid(row=0, column=1, padx=10, pady=10, sticky="ew")
+
+        # --- Log Console ---
+        self.log_box = ctk.CTkTextbox(self, width=600, height=200)
+        self.log_box.grid(row=4, column=0, padx=20, pady=(10, 20), sticky="nsew")
+        self.log_box.configure(state="disabled")
+
+        # --- Status Bar ---
+        self.status_label = ctk.CTkLabel(self, textvariable=self.status_msg, anchor="w")
+        self.status_label.grid(row=5, column=0, padx=20, pady=(0, 10), sticky="ew")
+
+    # ---------------- Logic ---------------- #
+
+    def log(self, message):
+        """Thread-safe logging."""
+        self.log_queue.put(message)
+
+    def check_log_queue(self):
+        """Poll the log queue and update UI."""
+        while not self.log_queue.empty():
+            msg = self.log_queue.get()
+            self.log_box.configure(state="normal")
+            self.log_box.insert("end", msg + "\n")
+            self.log_box.see("end")
+            self.log_box.configure(state="disabled")
+            self.status_msg.set(msg)
+        
+        self.after(100, self.check_log_queue)
+
+    def browse_input(self):
+        filename = filedialog.askopenfilename(filetypes=[("Media Files", "*.mp3 *.wav *.m4a *.mp4 *.avi *.mov *.mkv")])
+        if filename:
+            self.input_path.set(filename)
+
+    def browse_output(self):
+        dirname = filedialog.askdirectory()
+        if dirname:
+            self.output_dir.set(dirname)
+
+    def get_unique_filename(self, base_path):
+        if not os.path.exists(base_path):
+            return base_path
+        base, ext = os.path.splitext(base_path)
+        counter = 2
+        new_path = f"{base} ({counter}){ext}"
+        while os.path.exists(new_path):
+            counter += 1
+            new_path = f"{base} ({counter}){ext}"
+        return new_path
+
+    def extract_audio(self, video_path):
+        """Extract audio from video using ffmpeg."""
+        temp_audio = os.path.splitext(video_path)[0] + "_temp.wav"
+        try:
+            (
+                ffmpeg
+                .input(video_path)
+                .output(temp_audio, format='wav', acodec='pcm_s16le', ac=1, ar='16000')
+                .overwrite_output()
+                .run(quiet=True)
+            )
+            return temp_audio
+        except Exception as e:
+            raise RuntimeError(f"FFmpeg failed: {e}")
+
+    def run_transcription(self):
+        input_file = self.input_path.get()
+        output_folder = self.output_dir.get()
+        model_type = self.model_name.get()
+        use_timestamps = self.show_timestamps.get()
+
+        temp_file = None
+        start_time = time.time()
+
+        try:
+            self.log(f"Loading Whisper model: {model_type}...")
+            model = whisper.load_model(model_type)
+
+            if self.stop_event.is_set(): return
+
+            # Handle Video Input
+            if input_file.lower().endswith(('.mp4', '.avi', '.mov', '.mkv')):
+                self.log("Extracting audio from video...")
+                temp_file = self.extract_audio(input_file)
+                process_file = temp_file
+            else:
+                process_file = input_file
+
+            if self.stop_event.is_set(): return
+
+            self.log("Starting transcription (this may take a while)...")
+            
+            # Transcribe entire file (Whisper handles sliding window internally)
+            # We use fp16=False to avoid warnings on CPU, though it's slower.
+            # If user has GPU, they might want fp16=True. We'll stick to defaults or safe mode.
+            result = model.transcribe(process_file, verbose=False, fp16=False)
+
+            if self.stop_event.is_set(): return
+
+            # Save Output
+            output_filename = "Transcription.txt"
+            output_path = os.path.join(output_folder, output_filename)
+            output_path = self.get_unique_filename(output_path)
+
+            with open(output_path, "w", encoding="utf-8") as f:
+                if use_timestamps:
+                    for segment in result["segments"]:
+                        start = segment["start"]
+                        # Format timestamp [HH:MM:SS]
+                        timestamp = f"[{int(start//3600):02}:{int((start%3600)//60):02}:{int(start%60):02}]"
+                        text = segment["text"].strip()
+                        line = f"{timestamp} {text}"
+                        f.write(line + "\n")
+                else:
+                    f.write(result["text"].strip())
+
+            elapsed = time.time() - start_time
+            mins, secs = divmod(int(elapsed), 60)
+            self.log(f"✅ Transcription saved to: {output_path}")
+            self.log(f"⏱ Finished in {mins}m {secs}s")
+
+        except Exception as e:
+            self.log(f"❌ Error: {e}")
+        finally:
+            # Cleanup
+            if temp_file and os.path.exists(temp_file):
+                os.remove(temp_file)
+                self.log("Temporary audio file removed.")
+            
+            self.stop_event.clear()
+            self.is_transcribing = False
+            self.update_ui_state(transcribing=False)
+
+    def start_transcription(self):
+        if not self.input_path.get():
+            messagebox.showerror("Error", "Please select an input file.")
+            return
+        if not self.output_dir.get():
+            messagebox.showerror("Error", "Please select an output directory.")
+            return
+        
+        self.is_transcribing = True
+        self.stop_event.clear()
+        self.update_ui_state(transcribing=True)
+        self.log_box.configure(state="normal")
+        self.log_box.delete("1.0", "end")
+        self.log_box.configure(state="disabled")
+        
+        threading.Thread(target=self.run_transcription, daemon=True).start()
+
+    def stop_transcription(self):
+        if self.is_transcribing:
+            self.log("🛑 Stopping transcription...")
+            self.stop_event.set()
+
+    def update_ui_state(self, transcribing):
+        if transcribing:
+            self.start_btn.configure(state="disabled")
+            self.stop_btn.configure(state="normal")
+            self.input_frame.configure(fg_color="gray90") # Visual cue (optional)
+        else:
+            self.start_btn.configure(state="normal")
+            self.stop_btn.configure(state="disabled")
+
+if __name__ == "__main__":
+    app = AudioWhisperApp()
+    app.mainloop()
