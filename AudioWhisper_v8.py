@@ -133,7 +133,7 @@ class AudioWhisperApp(TkinterDnD_CTk):
         super().__init__()
 
         # Window Setup
-        self.title("AudioWhisper v8.0 (Modern UI)")
+        self.title("AudioWhisper v8.0")
         self.geometry("800x850")
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(4, weight=1) # Transcript expands
