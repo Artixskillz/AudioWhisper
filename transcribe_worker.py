@@ -122,6 +122,40 @@ def _ensure_model_downloaded(model_name):
             pass
 
 
+# ── VRAM Detection ─────────────────────────────────────
+
+# Approximate VRAM requirements per model in MB
+MODEL_VRAM_MB = {
+    "tiny": 500,
+    "base": 1000,
+    "small": 2000,
+    "medium": 5000,
+    "large-v3": 10000,
+}
+
+
+def _check_vram(model_name, device):
+    """Check if GPU has enough VRAM for the model. Emits a warning if not."""
+    if device != "cuda":
+        return
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if result.returncode == 0:
+            free_mb = int(result.stdout.strip().split("\n")[0])
+            required = MODEL_VRAM_MB.get(model_name, 0)
+            if required > 0 and free_mb < required:
+                emit("status",
+                     msg=f"Warning: {model_name} needs ~{required // 1000}GB VRAM, "
+                         f"but only {free_mb // 1000:.1f}GB free. May fall back to CPU.")
+    except Exception:
+        pass
+
+
 # ── Main ────────────────────────────────────────────────
 
 def main():
@@ -133,6 +167,7 @@ def main():
     parser.add_argument("--output_dir", default="")
     parser.add_argument("--timestamps", action="store_true")
     parser.add_argument("--export_srt", action="store_true")
+    parser.add_argument("--beam_size", type=int, default=0)
     args = parser.parse_args()
 
     input_file = args.input
@@ -143,6 +178,9 @@ def main():
 
         from faster_whisper import WhisperModel
         import librosa
+
+        # Check VRAM before downloading/loading
+        _check_vram(args.model, args.device)
 
         # Download model with progress (if needed)
         model_path = _ensure_model_downloaded(args.model)
@@ -174,8 +212,12 @@ def main():
 
         model = WhisperModel(model_path, device=args.device, compute_type=args.compute_type)
 
+        # Adaptive beam size: smaller models use fewer beams for speed
+        BEAM_SIZES = {"tiny": 1, "base": 3, "small": 3, "medium": 5, "large-v3": 5}
+        beam_size = args.beam_size if args.beam_size > 0 else BEAM_SIZES.get(args.model, 5)
+
         emit("status", msg="Transcribing...")
-        segments, info = model.transcribe(process_file, beam_size=5)
+        segments, info = model.transcribe(process_file, beam_size=beam_size)
 
         collected_segments = []
         start_time = time.time()

@@ -325,7 +325,7 @@ class WaveformVisualizer(ctk.CTkCanvas):
 
     def load_audio(self, file_path):
         try:
-            y, sr = librosa.load(file_path, sr=8000, duration=None)
+            y, sr = librosa.load(file_path, sr=4000, duration=30)
             chunk_size = max(len(y) // self.bars, 1)
             new_amps = []
             for i in range(self.bars):
@@ -405,9 +405,10 @@ class DropZone(ctk.CTkFrame):
         if self.command:
             self.command()
 
-    def set_file(self, filename):
+    def set_file(self, filename, info=""):
+        detail = info if info else "Ready to transcribe"
         self.label.configure(
-            text=f"{os.path.basename(filename)}\n\nReady to transcribe"
+            text=f"{os.path.basename(filename)}\n\n{detail}"
         )
         self.configure(fg_color=("#c8e6c9", "#2e7d32"))
 
@@ -841,7 +842,29 @@ class AudioWhisperApp(TkinterDnD_CTk):
     def _load_file(self, path):
         """Load a file into the UI, resetting previous state."""
         self.input_path.set(path)
-        self.drop_zone.set_file(path)
+
+        # Compute file info for the drop zone
+        file_info = ""
+        try:
+            size_bytes = os.path.getsize(path)
+            if size_bytes >= 1024 * 1024 * 1024:
+                size_str = f"{size_bytes / (1024**3):.1f} GB"
+            elif size_bytes >= 1024 * 1024:
+                size_str = f"{size_bytes / (1024**2):.1f} MB"
+            else:
+                size_str = f"{size_bytes / 1024:.0f} KB"
+            dur = librosa.get_duration(path=path)
+            if dur >= 3600:
+                dur_str = f"{int(dur // 3600)}h {int((dur % 3600) // 60)}m"
+            elif dur >= 60:
+                dur_str = f"{int(dur // 60)}m {int(dur % 60)}s"
+            else:
+                dur_str = f"{int(dur)}s"
+            file_info = f"{dur_str}  |  {size_str}"
+        except Exception:
+            pass
+
+        self.drop_zone.set_file(path, info=file_info)
         # Reset progress from previous transcription
         self.progress_val.set(0)
         self.progress_bar.set(0)
@@ -1028,6 +1051,10 @@ class AudioWhisperApp(TkinterDnD_CTk):
 
     def _stop_transcription(self):
         if self.is_transcribing:
+            if not messagebox.askyesno(
+                APP_NAME, "Stop the current transcription?\nAny progress will be lost."
+            ):
+                return
             self.stop_event.set()
             if self._worker_proc and self._worker_proc.poll() is None:
                 self._worker_proc.terminate()
