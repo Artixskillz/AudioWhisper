@@ -44,3 +44,22 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: de
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: nowait postinstall skipifsilent
+
+[UninstallDelete]
+; Clean up the AppData folder (embedded Python, models, settings — everything)
+Type: filesandordirs; Name: "{userappdata}\{#MyAppName}"
+
+[Code]
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  if CurUninstallStep = usPostUninstall then
+  begin
+    // Confirm before deleting AppData (models can be large)
+    if MsgBox('Do you also want to remove downloaded models and settings?'#13#10 +
+              'This will free up disk space but you''ll need to re-download them if you reinstall.',
+              mbConfirmation, MB_YESNO) = IDYES then
+    begin
+      DelTree(ExpandConstant('{userappdata}\{#MyAppName}'), True, True, True);
+    end;
+  end;
+end;
