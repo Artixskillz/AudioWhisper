@@ -11,7 +11,6 @@ import os
 import json
 import time
 import argparse
-import datetime
 
 
 def emit(msg_type, **kwargs):
@@ -19,6 +18,111 @@ def emit(msg_type, **kwargs):
     kwargs["type"] = msg_type
     print(json.dumps(kwargs, ensure_ascii=False), flush=True)
 
+
+# ── Model Download with Progress ───────────────────────
+
+# Map faster-whisper model names to HuggingFace repo IDs
+MODEL_REPOS = {
+    "tiny":     "Systran/faster-whisper-tiny",
+    "base":     "Systran/faster-whisper-base",
+    "small":    "Systran/faster-whisper-small",
+    "medium":   "Systran/faster-whisper-medium",
+    "large-v3": "Systran/faster-whisper-large-v3",
+}
+
+
+def _ensure_model_downloaded(model_name):
+    """Download the model with progress reporting, return the cache path."""
+    from huggingface_hub import snapshot_download, scan_cache_dir
+    import huggingface_hub
+
+    repo_id = MODEL_REPOS.get(model_name)
+    if not repo_id:
+        # Unknown model — let faster-whisper handle it
+        return model_name
+
+    # Check if already cached
+    try:
+        cache_dir = huggingface_hub.constants.HF_HUB_CACHE
+        cache_info = scan_cache_dir(cache_dir)
+        for repo in cache_info.repos:
+            if repo.repo_id == repo_id and repo.size_on_disk > 0:
+                # Already downloaded — find the snapshot path
+                for revision in repo.revisions:
+                    return str(revision.snapshot_path)
+    except Exception:
+        pass
+
+    # Download with progress
+    emit("status", msg=f"Downloading {model_name} model...")
+
+    last_report = [0.0]
+
+    def _progress_callback(current, total):
+        if total and total > 0:
+            pct = current / total
+            # Only report every 2% to avoid flooding
+            if pct - last_report[0] >= 0.02 or pct >= 1.0:
+                last_report[0] = pct
+                mb_done = current / (1024 * 1024)
+                mb_total = total / (1024 * 1024)
+                if mb_total >= 1024:
+                    emit("model_download", value=pct,
+                         msg=f"Downloading {model_name} model: {mb_done / 1024:.1f} / {mb_total / 1024:.1f} GB")
+                else:
+                    emit("model_download", value=pct,
+                         msg=f"Downloading {model_name} model: {mb_done:.0f} / {mb_total:.0f} MB")
+
+    # Try using tqdm callback for progress
+    try:
+        from huggingface_hub.utils import tqdm as hf_tqdm
+        import tqdm as tqdm_module
+
+        original_init = tqdm_module.tqdm.__init__
+        original_update = tqdm_module.tqdm.update
+        _bars = {}
+
+        class ProgressTracker:
+            def __init__(self):
+                self.total = 0
+                self.current = 0
+
+        tracker = ProgressTracker()
+
+        def patched_init(self_tqdm, *args, **kwargs):
+            original_init(self_tqdm, *args, **kwargs)
+            if hasattr(self_tqdm, 'total') and self_tqdm.total and self_tqdm.total > 1024 * 1024:
+                tracker.total = self_tqdm.total
+                tracker.current = 0
+
+        def patched_update(self_tqdm, n=1):
+            original_update(self_tqdm, n)
+            if tracker.total > 0:
+                tracker.current += n
+                _progress_callback(tracker.current, tracker.total)
+
+        tqdm_module.tqdm.__init__ = patched_init
+        tqdm_module.tqdm.update = patched_update
+    except Exception:
+        pass
+
+    try:
+        path = snapshot_download(repo_id)
+        emit("status", msg=f"Model {model_name} ready")
+        return path
+    except Exception as e:
+        emit("status", msg=f"Model download issue, trying fallback: {e}")
+        return model_name
+    finally:
+        # Restore tqdm
+        try:
+            tqdm_module.tqdm.__init__ = original_init
+            tqdm_module.tqdm.update = original_update
+        except Exception:
+            pass
+
+
+# ── Main ────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser()
@@ -35,12 +139,17 @@ def main():
     output_dir = args.output_dir or os.path.dirname(input_file)
 
     try:
-        emit("status", msg="Loading model (may download on first use)...")
+        emit("status", msg="Preparing model...")
 
         from faster_whisper import WhisperModel
         import librosa
 
-        # Get audio duration
+        # Download model with progress (if needed)
+        model_path = _ensure_model_downloaded(args.model)
+
+        emit("status", msg="Loading model...")
+
+        # Prepare audio
         total_duration = 0
         process_file = input_file
         temp_file = None
@@ -63,7 +172,7 @@ def main():
         except Exception:
             total_duration = 0
 
-        model = WhisperModel(args.model, device=args.device, compute_type=args.compute_type)
+        model = WhisperModel(model_path, device=args.device, compute_type=args.compute_type)
 
         emit("status", msg="Transcribing...")
         segments, info = model.transcribe(process_file, beam_size=5)

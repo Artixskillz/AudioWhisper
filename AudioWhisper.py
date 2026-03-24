@@ -636,7 +636,10 @@ class AudioWhisperApp(TkinterDnD_CTk):
         # Load settings
         self.settings = self._load_settings()
         self.model_name.set(self.settings.get("model", "base"))
-        self.output_dir.set(self.settings.get("output_dir", ""))
+        default_output = os.path.join(os.path.expanduser("~"), "Downloads")
+        if not os.path.isdir(default_output):
+            default_output = os.path.expanduser("~")
+        self.output_dir.set(self.settings.get("output_dir", "") or default_output)
         self.show_timestamps.set(self.settings.get("timestamps", True))
         self.export_srt.set(self.settings.get("export_srt", False))
 
@@ -835,22 +838,36 @@ class AudioWhisperApp(TkinterDnD_CTk):
             ctk.set_appearance_mode("Dark")
             self.visualizer.configure(bg="#2B2B2B")
 
+    def _load_file(self, path):
+        """Load a file into the UI, resetting previous state."""
+        self.input_path.set(path)
+        self.drop_zone.set_file(path)
+        # Reset progress from previous transcription
+        self.progress_val.set(0)
+        self.progress_bar.set(0)
+        self.visualizer.reset()
+        self.status_msg.set("Ready")
+        self.time_remaining_msg.set("")
+        self.open_folder_btn.configure(state="disabled")
+        self.transcript_box.configure(state="normal")
+        self.transcript_box.delete("1.0", "end")
+        self.transcript_box.insert("1.0", "Your transcription will appear here.\n")
+        self.transcript_box.configure(state="disabled")
+        # Load waveform
+        threading.Thread(target=self.visualizer.load_audio, args=(path,), daemon=True).start()
+
     def _drop_file(self, event):
         path = event.data
         if path.startswith("{") and path.endswith("}"):
             path = path[1:-1]
-        self.input_path.set(path)
-        self.drop_zone.set_file(path)
-        threading.Thread(target=self.visualizer.load_audio, args=(path,), daemon=True).start()
+        self._load_file(path)
 
     def _browse_input(self):
         path = filedialog.askopenfilename(
             filetypes=[("Media Files", SUPPORTED_FORMATS)]
         )
         if path:
-            self.input_path.set(path)
-            self.drop_zone.set_file(path)
-            threading.Thread(target=self.visualizer.load_audio, args=(path,), daemon=True).start()
+            self._load_file(path)
 
     def _browse_output(self):
         d = filedialog.askdirectory()
@@ -973,6 +990,9 @@ class AudioWhisperApp(TkinterDnD_CTk):
                 msg_type = msg.get("type")
                 if msg_type == "status":
                     self._log(msg["msg"])
+                elif msg_type == "model_download":
+                    self._log(msg.get("msg", "Downloading model..."))
+                    self.time_remaining_msg.set(f"{int(msg.get('value', 0) * 100)}%")
                 elif msg_type == "segment":
                     self._log(f"{msg['timestamp']} {msg['text']}", is_transcript=True)
                 elif msg_type == "progress":
