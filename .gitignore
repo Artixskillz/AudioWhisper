@@ -16,5 +16,10 @@ settings.json
 .vscode/
 .idea/
 
+# Installer output
+installer_output/
+
 # Generated
 generate_icon.py
+version_info.txt
+version_info.py

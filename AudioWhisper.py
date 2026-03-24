@@ -206,22 +206,37 @@ class DependencyManager:
             return False
 
     def _download_file(self, url, dest, progress_cb, start_pct, end_pct):
-        """Download a file with progress reporting."""
-        req = urllib.request.Request(url, headers={"User-Agent": "AudioWhisper/1.0"})
-        response = urllib.request.urlopen(req)
+        """Download a file with progress reporting and timeout."""
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "AudioWhisper/1.0"})
+            response = urllib.request.urlopen(req, timeout=30)
+        except Exception as e:
+            raise RuntimeError(
+                f"Download failed — check your internet connection.\n{e}"
+            )
+
         total = int(response.headers.get("Content-Length", 0))
         downloaded = 0
         block_size = 65536
 
         with open(dest, "wb") as f:
             while True:
-                chunk = response.read(block_size)
+                try:
+                    chunk = response.read(block_size)
+                except Exception as e:
+                    # Clean up partial file
+                    f.close()
+                    if os.path.exists(dest):
+                        os.remove(dest)
+                    raise RuntimeError(
+                        f"Download interrupted — check your internet connection.\n{e}"
+                    )
                 if not chunk:
                     break
                 f.write(chunk)
                 downloaded += len(chunk)
                 if total > 0:
-                    pct = start_pct + (end_pct - start_pct) * (downloaded / total)
+                    pct = start_pct + (end_pct - start_pct) * min(downloaded / total, 1.0)
                     progress_cb(pct)
 
     def _run_pip_with_progress(self, cmd, progress_cb, start_pct, end_pct, status_cb):
@@ -415,6 +430,10 @@ class InstallDialog(ctk.CTkToplevel):
         self.title(f"{APP_NAME} — Installing")
         self.geometry("500x280")
         self.resizable(False, False)
+        try:
+            self.after(200, lambda: self.iconbitmap(_resource_path("AudioWhisper.ico")))
+        except Exception:
+            pass
         self.transient(parent)
         self.grab_set()
         self.dep_manager = dep_manager
@@ -498,6 +517,10 @@ class SetupDialog(ctk.CTkToplevel):
         self.title(f"{APP_NAME} — Setup")
         self.geometry("520x480")
         self.resizable(False, False)
+        try:
+            self.after(200, lambda: self.iconbitmap(_resource_path("AudioWhisper.ico")))
+        except Exception:
+            pass
         self.transient(parent)
         self.grab_set()
         self.settings = settings
@@ -583,6 +606,10 @@ class AudioWhisperApp(TkinterDnD_CTk):
         self.title(APP_NAME)
         self.geometry("800x900")
         self.minsize(700, 700)
+        try:
+            self.iconbitmap(default=_resource_path("AudioWhisper.ico"))
+        except Exception:
+            pass
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(5, weight=1)
 
@@ -963,6 +990,14 @@ class AudioWhisperApp(TkinterDnD_CTk):
                     self._log(f"Error: {msg['msg']}")
 
             self._worker_proc.wait()
+
+            # If the worker crashed, show stderr
+            if self._worker_proc.returncode and self._worker_proc.returncode != 0:
+                stderr_output = self._worker_proc.stderr.read().strip()
+                if stderr_output:
+                    # Show the last meaningful line
+                    last_lines = stderr_output.strip().splitlines()[-3:]
+                    self._log(f"Error: {' | '.join(last_lines)}")
 
         except Exception as e:
             self._log(f"Error: {e}")
