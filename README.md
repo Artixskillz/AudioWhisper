@@ -1,53 +1,62 @@
-# AudioWhisper 🎙️
+# AudioWhisper
 
-**AudioWhisper** is a modern, user-friendly desktop application for transcribing audio and video files using OpenAI's state-of-the-art **Whisper** model.
+**Free, private, offline transcription for audio and video files.**
 
-It features a **Smart Installer** that automatically detects your hardware (NVIDIA GPU or CPU) and sets up the optimized environment for you—making it completely portable and hassle-free.
+AudioWhisper turns your spoken words into text — entirely on your own computer. Nothing is uploaded, no account is needed, and it works with or without an internet connection after setup.
 
-## 🚀 Key Features
-
-*   **🤖 Smart Installation**: Automatically detects your GPU (including the latest RTX 50-series) and installs the correct PyTorch/CUDA drivers. No manual setup required.
-*   **⚡ GPU Acceleration**: Fully utilizes NVIDIA GPUs for blazing fast transcription. Falls back to CPU automatically if needed.
-*   **🖱️ Drag & Drop**: Simply drag your audio or video files onto the app to load them.
-*   **📝 Subtitle Export**: Generate `.SRT` subtitles for YouTube, VLC, or Premiere Pro with a single click.
-*   **💾 Persistent Settings**: Remembers your favorite model, output folder, and preferences.
-*   **🎨 Modern UI**: Built with `CustomTkinter` for a sleek, dark-mode compatible interface.
-*   **📹 Video Support**: Extracts audio automatically from MP4, MKV, AVI, and MOV files.
-
-## 📦 Installation
-
-1.  **Install Python** (3.10 or newer recommended).
-2.  **Install FFmpeg**:
-    *   *Windows*: `winget install ffmpeg` (or download from [ffmpeg.org](https://ffmpeg.org/download.html) and add to PATH).
-3.  **Download** `AudioWhisper_v6.py`.
-4.  **Run it**:
-    ```bash
-    python AudioWhisper_v6.py
-    ```
-    *The app will automatically install all necessary Python libraries (Torch, Whisper, etc.) on the first run.*
-
-## 🛠️ Usage
-
-1.  **Select Input**: Drag & drop a file or click "Browse".
-2.  **Select Output**: Choose where to save the text files.
-3.  **Choose Model**:
-    *   `tiny` / `base`: Fast, good for clear audio.
-    *   `small` / `medium`: Balanced speed and accuracy.
-    *   `large`: Maximum accuracy (requires more VRAM).
-4.  **Options**:
-    *   *Timestamps*: Saves a text file with `[00:00:10]` markers.
-    *   *Export Subtitles*: Creates a standard `.srt` file.
-5.  **Start**: Click "Start Transcription" and watch the real-time logs!
-
-## 🔧 Requirements
-
-*   Python 3.8+
-*   FFmpeg (must be in system PATH)
-*   **Optional**: NVIDIA GPU (RTX 30xx/40xx/50xx) for acceleration.
-
-## 📄 License
-
-MIT License. Free to use and modify.
+Powered by OpenAI's [Whisper](https://github.com/openai/whisper) model via [faster-whisper](https://github.com/SYSTRAN/faster-whisper) for maximum speed.
 
 ---
-*Powered by [OpenAI Whisper](https://github.com/openai/whisper) and [CustomTkinter](https://github.com/TomSchimansky/CustomTkinter).*
+
+## Download
+
+**[Download the latest installer from Releases](https://github.com/Artixskillz/AudioWhisper/releases/latest)**
+
+Run the installer, launch the app, and start transcribing. That's it.
+
+---
+
+## Features
+
+- **Drag & drop** any audio or video file to transcribe it
+- **GPU accelerated** — automatically uses your NVIDIA GPU if available, falls back to CPU
+- **Multiple models** — from fast/rough (`tiny`) to slow/accurate (`large-v3`)
+- **Subtitle export** — generate `.srt` files for YouTube, Premiere, VLC, etc.
+- **Timestamps** — optional time markers in the transcript
+- **Pause & resume** — pause transcription and pick up where you left off
+- **Waveform preview** — visual progress through your audio
+- **Dark & light mode** — switch with one click
+- **Private** — everything runs locally, nothing leaves your machine
+
+## Supported Formats
+
+**Audio:** MP3, WAV, M4A, FLAC, OGG, WMA, AAC
+**Video:** MP4, AVI, MOV, MKV, WebM (requires [FFmpeg](https://ffmpeg.org))
+
+## Requirements
+
+- **Windows 10/11** (64-bit)
+- **FFmpeg** for video files — install with `winget install ffmpeg` or download from [ffmpeg.org](https://ffmpeg.org/download.html)
+- **Optional:** NVIDIA GPU (RTX 20/30/40/50 series) for faster transcription
+
+## How It Works
+
+1. **Install** — run the installer from the Releases page
+2. **Drop a file** — drag an audio or video file into the app (or click to browse)
+3. **Transcribe** — hit Start and watch the live transcript appear
+4. **Save** — output is saved as a `.txt` file (and `.srt` if enabled)
+
+The first time you use a model size, it will be downloaded automatically (~75 MB for `base`, up to ~3 GB for `large-v3`). This only happens once per model.
+
+## Building from Source
+
+```bash
+pip install pyinstaller customtkinter tkinterdnd2 faster-whisper ffmpeg-python librosa soundfile numpy torch
+python build.py
+```
+
+The EXE will be in the `dist/` folder. To build the installer, install [Inno Setup](https://jrsoftware.org/isinfo.php) and compile `installer.iss`.
+
+## License
+
+MIT

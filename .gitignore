@@ -1,0 +1,21 @@
+# Build artifacts
+build/
+dist/
+*.spec
+*.exe
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# User settings
+settings.json
+
+# IDE
+.vscode/
+.idea/
+
+# Generated
+*.ico
+generate_icon.py
