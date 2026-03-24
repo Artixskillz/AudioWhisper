@@ -1,6 +1,6 @@
 """
 Build script for AudioWhisper.
-Produces a single-file EXE with PyInstaller.
+Produces a lightweight EXE (no torch/whisper — those install on first run).
 
 Usage:
     python build.py
@@ -22,13 +22,19 @@ cmd = [
     "--noconsole",
     "--onefile",
     "--clean",
-    # Hidden imports
+    # Bundle the worker script
+    "--add-data=transcribe_worker.py;.",
+    # Hidden imports for the GUI
     "--hidden-import=babel.numbers",
     "--hidden-import=tkinterdnd2",
     "--hidden-import=customtkinter",
-    "--hidden-import=faster_whisper",
-    "--hidden-import=sklearn.utils._typedefs",
-    "--hidden-import=sklearn.neighbors._partition_nodes",
+    # Exclude heavy ML deps (installed at runtime)
+    "--exclude-module=torch",
+    "--exclude-module=faster_whisper",
+    "--exclude-module=ctranslate2",
+    "--exclude-module=huggingface_hub",
+    "--exclude-module=tokenizers",
+    "--exclude-module=safetensors",
     # Data files
     f"--add-data={ctk_path};customtkinter",
     f"--add-data={dnd_path};tkinterdnd2",
@@ -37,6 +43,6 @@ cmd = [
 if icon_arg:
     cmd.append(icon_arg)
 
-print("Building AudioWhisper...")
+print("Building AudioWhisper (lightweight — no torch/whisper)...")
 PyInstaller.__main__.run(cmd)
 print("Done! Check the 'dist' folder for AudioWhisper.exe")

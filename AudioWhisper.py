@@ -5,19 +5,17 @@ import threading
 import time
 import queue
 import json
-import datetime
 import shutil
+import urllib.request
+import zipfile
+import re
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
 import numpy as np
 import customtkinter as ctk
 from tkinterdnd2 import DND_FILES, TkinterDnD
-from faster_whisper import WhisperModel
-import ffmpeg
 import librosa
-import soundfile as sf
-import torch
 
 # ──────────────────────────────────────────────────────────
 #  Configuration
@@ -36,12 +34,15 @@ MODELS = {
 
 SUPPORTED_FORMATS = "*.mp3 *.wav *.m4a *.flac *.ogg *.wma *.aac *.mp4 *.avi *.mov *.mkv *.webm"
 
+PYTHON_EMBED_URL = "https://www.python.org/ftp/python/3.11.9/python-3.11.9-embed-amd64.zip"
+PYTHON_EMBED_DIR = "python-3.11.9-embed"
+GET_PIP_URL = "https://bootstrap.pypa.io/get-pip.py"
+
 ctk.set_appearance_mode("System")
 ctk.set_default_color_theme("blue")
 
 
 def get_app_data_dir():
-    """Return the app's persistent data directory in AppData."""
     if sys.platform == "win32":
         base = os.environ.get("APPDATA", os.path.expanduser("~"))
     else:
@@ -52,8 +53,199 @@ def get_app_data_dir():
 
 
 def check_ffmpeg():
-    """Check if FFmpeg is available on the system."""
     return shutil.which("ffmpeg") is not None
+
+
+def _resource_path(filename):
+    """Get the path to a bundled resource file (works frozen or not)."""
+    if getattr(sys, "frozen", False):
+        base = sys._MEIPASS
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, filename)
+
+
+# ──────────────────────────────────────────────────────────
+#  Dependency Manager
+# ──────────────────────────────────────────────────────────
+
+class DependencyManager:
+    """Manages the embedded Python environment and heavy dependencies."""
+
+    def __init__(self, app_data_dir):
+        self.app_data_dir = app_data_dir
+        self.python_dir = os.path.join(app_data_dir, PYTHON_EMBED_DIR)
+        self.python_exe = os.path.join(self.python_dir, "python.exe")
+        self.worker_path = os.path.join(app_data_dir, "transcribe_worker.py")
+        self.marker_file = os.path.join(app_data_dir, "deps_installed.json")
+
+    def is_installed(self):
+        if not os.path.exists(self.marker_file):
+            return False
+        try:
+            with open(self.marker_file) as f:
+                data = json.load(f)
+            return data.get("version") == APP_VERSION
+        except Exception:
+            return False
+
+    def has_gpu(self):
+        """Check for NVIDIA GPU by looking for nvidia-smi."""
+        return shutil.which("nvidia-smi") is not None
+
+    def get_python_exe(self):
+        return self.python_exe
+
+    def get_worker_path(self):
+        return self.worker_path
+
+    def install(self, progress_callback=None, status_callback=None):
+        """Download and install the embedded Python + heavy deps."""
+        def status(msg):
+            if status_callback:
+                status_callback(msg)
+
+        def progress(pct):
+            if progress_callback:
+                progress_callback(pct)
+
+        try:
+            # Step 1: Download embedded Python
+            status("Downloading Python runtime...")
+            progress(0.0)
+            zip_path = os.path.join(self.app_data_dir, "python_embed.zip")
+
+            if not os.path.exists(self.python_exe):
+                self._download_file(PYTHON_EMBED_URL, zip_path, progress, 0.0, 0.1)
+
+                # Extract
+                status("Extracting Python runtime...")
+                os.makedirs(self.python_dir, exist_ok=True)
+                with zipfile.ZipFile(zip_path, "r") as zf:
+                    zf.extractall(self.python_dir)
+                os.remove(zip_path)
+
+                # Enable site-packages by editing ._pth file
+                for f in os.listdir(self.python_dir):
+                    if f.endswith("._pth"):
+                        pth_path = os.path.join(self.python_dir, f)
+                        with open(pth_path, "r") as fh:
+                            content = fh.read()
+                        content = content.replace("#import site", "import site")
+                        with open(pth_path, "w") as fh:
+                            fh.write(content)
+                        break
+
+            progress(0.1)
+
+            # Step 2: Install pip
+            status("Setting up pip...")
+            pip_exe = os.path.join(self.python_dir, "Scripts", "pip.exe")
+            if not os.path.exists(pip_exe):
+                get_pip_path = os.path.join(self.app_data_dir, "get-pip.py")
+                self._download_file(GET_PIP_URL, get_pip_path, progress, 0.1, 0.15)
+                subprocess.run(
+                    [self.python_exe, get_pip_path, "--no-warn-script-location"],
+                    cwd=self.python_dir,
+                    capture_output=True,
+                )
+                if os.path.exists(get_pip_path):
+                    os.remove(get_pip_path)
+
+            progress(0.15)
+
+            # Step 3: Install torch
+            use_gpu = self.has_gpu()
+            if use_gpu:
+                status("Installing PyTorch with GPU support (this may take a while)...")
+                torch_cmd = [
+                    self.python_exe, "-m", "pip", "install",
+                    "torch", "--no-warn-script-location",
+                    "--index-url", "https://download.pytorch.org/whl/cu124",
+                ]
+            else:
+                status("Installing PyTorch (CPU)...")
+                torch_cmd = [
+                    self.python_exe, "-m", "pip", "install",
+                    "torch", "--no-warn-script-location",
+                    "--index-url", "https://download.pytorch.org/whl/cpu",
+                ]
+
+            self._run_pip_with_progress(torch_cmd, progress, 0.15, 0.75, status)
+
+            # Step 4: Install faster-whisper and audio deps
+            status("Installing transcription engine...")
+            whisper_cmd = [
+                self.python_exe, "-m", "pip", "install",
+                "faster-whisper", "ffmpeg-python", "librosa", "soundfile",
+                "--no-warn-script-location",
+            ]
+            self._run_pip_with_progress(whisper_cmd, progress, 0.75, 0.95, status)
+
+            progress(0.95)
+
+            # Step 5: Deploy worker script
+            status("Finalizing setup...")
+            worker_src = _resource_path("transcribe_worker.py")
+            shutil.copy2(worker_src, self.worker_path)
+
+            # Mark as complete
+            with open(self.marker_file, "w") as f:
+                json.dump({"version": APP_VERSION, "gpu": use_gpu}, f)
+
+            progress(1.0)
+            status("Setup complete!")
+            return True
+
+        except Exception as e:
+            status(f"Installation failed: {e}")
+            # Clean up partial install so next attempt starts fresh
+            if os.path.exists(self.marker_file):
+                os.remove(self.marker_file)
+            return False
+
+    def _download_file(self, url, dest, progress_cb, start_pct, end_pct):
+        """Download a file with progress reporting."""
+        req = urllib.request.Request(url, headers={"User-Agent": "AudioWhisper/1.0"})
+        response = urllib.request.urlopen(req)
+        total = int(response.headers.get("Content-Length", 0))
+        downloaded = 0
+        block_size = 65536
+
+        with open(dest, "wb") as f:
+            while True:
+                chunk = response.read(block_size)
+                if not chunk:
+                    break
+                f.write(chunk)
+                downloaded += len(chunk)
+                if total > 0:
+                    pct = start_pct + (end_pct - start_pct) * (downloaded / total)
+                    progress_cb(pct)
+
+    def _run_pip_with_progress(self, cmd, progress_cb, start_pct, end_pct, status_cb):
+        """Run a pip command and estimate progress from output."""
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, cwd=self.python_dir,
+        )
+        lines = []
+        for line in proc.stdout:
+            lines.append(line.strip())
+            # Parse pip download progress
+            match = re.search(r"(\d+)%", line)
+            if match:
+                pip_pct = int(match.group(1)) / 100.0
+                pct = start_pct + (end_pct - start_pct) * pip_pct
+                progress_cb(pct)
+            # Show what's being installed
+            if line.strip().startswith("Collecting") or line.strip().startswith("Downloading"):
+                pkg = line.strip().split()[-1] if line.strip().split() else ""
+                status_cb(f"Installing: {pkg}")
+        proc.wait()
+        if proc.returncode != 0:
+            raise RuntimeError(f"pip install failed:\n{''.join(lines[-10:])}")
+        progress_cb(end_pct)
 
 
 # ──────────────────────────────────────────────────────────
@@ -167,13 +359,96 @@ class DropZone(ctk.CTkFrame):
 
 
 # ──────────────────────────────────────────────────────────
+#  Dependency Install Dialog
+# ──────────────────────────────────────────────────────────
+
+class InstallDialog(ctk.CTkToplevel):
+    """Shows progress while installing dependencies."""
+
+    def __init__(self, parent, dep_manager):
+        super().__init__(parent)
+        self.title(f"{APP_NAME} — Installing")
+        self.geometry("500x280")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+        self.dep_manager = dep_manager
+        self.success = False
+
+        self.update_idletasks()
+        x = (self.winfo_screenwidth() - 500) // 2
+        y = (self.winfo_screenheight() - 280) // 2
+        self.geometry(f"+{x}+{y}")
+
+        ctk.CTkLabel(
+            self, text="Setting up AudioWhisper",
+            font=("Segoe UI", 20, "bold"),
+        ).pack(pady=(25, 5))
+
+        ctk.CTkLabel(
+            self,
+            text="Downloading and installing the transcription engine.\nThis only happens once.",
+            font=("Segoe UI", 12), text_color="gray60", justify="center",
+        ).pack(pady=(0, 20))
+
+        self.status_var = ctk.StringVar(value="Preparing...")
+        ctk.CTkLabel(
+            self, textvariable=self.status_var,
+            font=("Segoe UI", 12),
+        ).pack(pady=(0, 10))
+
+        self.progress_var = ctk.DoubleVar(value=0.0)
+        self.progress_bar = ctk.CTkProgressBar(self, variable=self.progress_var, width=400)
+        self.progress_bar.pack(pady=(0, 10))
+        self.progress_bar.set(0)
+
+        self.pct_label = ctk.CTkLabel(
+            self, text="0%", font=("Segoe UI", 11, "bold"), text_color="gray60",
+        )
+        self.pct_label.pack()
+
+        self.protocol("WM_DELETE_WINDOW", lambda: None)  # Prevent closing during install
+
+        self._msg_queue = queue.Queue()
+        self.after(100, self._poll_queue)
+        threading.Thread(target=self._run_install, daemon=True).start()
+
+    def _run_install(self):
+        def on_progress(pct):
+            self._msg_queue.put(("progress", pct))
+
+        def on_status(msg):
+            self._msg_queue.put(("status", msg))
+
+        result = self.dep_manager.install(
+            progress_callback=on_progress,
+            status_callback=on_status,
+        )
+        self._msg_queue.put(("done", result))
+
+    def _poll_queue(self):
+        while not self._msg_queue.empty():
+            kind, value = self._msg_queue.get()
+            if kind == "progress":
+                self.progress_var.set(value)
+                self.pct_label.configure(text=f"{int(value * 100)}%")
+            elif kind == "status":
+                self.status_var.set(value)
+            elif kind == "done":
+                self.success = value
+                self.destroy()
+                return
+        self.after(100, self._poll_queue)
+
+
+# ──────────────────────────────────────────────────────────
 #  First-Run Setup Dialog
 # ──────────────────────────────────────────────────────────
 
 class SetupDialog(ctk.CTkToplevel):
     """Shown on first launch to welcome the user and pick defaults."""
 
-    def __init__(self, parent, settings):
+    def __init__(self, parent, settings, has_gpu):
         super().__init__(parent)
         self.title(f"{APP_NAME} — Setup")
         self.geometry("520x480")
@@ -183,13 +458,11 @@ class SetupDialog(ctk.CTkToplevel):
         self.settings = settings
         self.result = None
 
-        # Center on screen
         self.update_idletasks()
         x = (self.winfo_screenwidth() - 520) // 2
         y = (self.winfo_screenheight() - 480) // 2
         self.geometry(f"+{x}+{y}")
 
-        # Content
         ctk.CTkLabel(
             self, text=f"Welcome to {APP_NAME}",
             font=("Segoe UI", 22, "bold"),
@@ -198,20 +471,16 @@ class SetupDialog(ctk.CTkToplevel):
         ctk.CTkLabel(
             self,
             text="Free, private, offline audio & video transcription.\nEverything runs on your machine — nothing is uploaded.",
-            font=("Segoe UI", 13),
-            text_color="gray60",
-            justify="center",
+            font=("Segoe UI", 13), text_color="gray60", justify="center",
         ).pack(pady=(0, 20))
 
-        # Device info
-        device = "NVIDIA GPU (CUDA)" if torch.cuda.is_available() else "CPU"
-        device_color = "#4CAF50" if torch.cuda.is_available() else "#FF9800"
+        device = "NVIDIA GPU (CUDA)" if has_gpu else "CPU"
+        device_color = "#4CAF50" if has_gpu else "#FF9800"
         ctk.CTkLabel(
             self, text=f"Detected hardware:  {device}",
             font=("Segoe UI", 13, "bold"), text_color=device_color,
         ).pack(pady=(0, 20))
 
-        # Model picker
         ctk.CTkLabel(
             self, text="Choose a default model size:",
             font=("Segoe UI", 14, "bold"),
@@ -221,8 +490,7 @@ class SetupDialog(ctk.CTkToplevel):
         for name, desc in MODELS.items():
             ctk.CTkRadioButton(
                 self, text=f"{name}  —  {desc}",
-                variable=self.model_var, value=name,
-                font=("Segoe UI", 12),
+                variable=self.model_var, value=name, font=("Segoe UI", 12),
             ).pack(anchor="w", padx=60, pady=2)
 
         ctk.CTkLabel(
@@ -231,14 +499,12 @@ class SetupDialog(ctk.CTkToplevel):
             font=("Segoe UI", 11), text_color="gray50", justify="center",
         ).pack(pady=(15, 10))
 
-        # FFmpeg warning
         if not check_ffmpeg():
             ctk.CTkLabel(
                 self,
                 text="FFmpeg not found — video files won't work.\n"
                      "Install it:  winget install ffmpeg",
-                font=("Segoe UI", 12, "bold"), text_color="#F44336",
-                justify="center",
+                font=("Segoe UI", 12, "bold"), text_color="#F44336", justify="center",
             ).pack(pady=(5, 5))
 
         ctk.CTkButton(
@@ -275,9 +541,10 @@ class AudioWhisperApp(TkinterDnD_CTk):
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(5, weight=1)
 
-        # Paths
+        # Paths & managers
         self.app_data_dir = get_app_data_dir()
         self.settings_file = os.path.join(self.app_data_dir, "settings.json")
+        self.dep_manager = DependencyManager(self.app_data_dir)
 
         # State
         self.input_path = ctk.StringVar()
@@ -290,10 +557,9 @@ class AudioWhisperApp(TkinterDnD_CTk):
         self.time_remaining_msg = ctk.StringVar(value="")
 
         self.is_transcribing = False
-        self.is_paused = False
         self.stop_event = threading.Event()
-        self.pause_event = threading.Event()
         self.log_queue = queue.Queue()
+        self._worker_proc = None
 
         # Load settings
         self.settings = self._load_settings()
@@ -302,9 +568,10 @@ class AudioWhisperApp(TkinterDnD_CTk):
         self.show_timestamps.set(self.settings.get("timestamps", True))
         self.export_srt.set(self.settings.get("export_srt", False))
 
-        # Device
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.compute_type = "float16" if self.device == "cuda" else "float32"
+        # Device detection (lightweight — just check nvidia-smi)
+        self.has_gpu = self.dep_manager.has_gpu()
+        self.device = "cuda" if self.has_gpu else "cpu"
+        self.compute_type = "float16" if self.has_gpu else "float32"
 
         # Build UI
         self._create_widgets()
@@ -348,11 +615,24 @@ class AudioWhisperApp(TkinterDnD_CTk):
     # ── First-run ───────────────────────────────────────
 
     def _show_setup(self):
-        dialog = SetupDialog(self, self.settings)
+        dialog = SetupDialog(self, self.settings, self.has_gpu)
         self.wait_window(dialog)
         if dialog.result:
             self.model_name.set(dialog.result)
         self._save_settings()
+
+        # Install dependencies if needed
+        if not self.dep_manager.is_installed():
+            self._install_deps()
+
+    def _install_deps(self):
+        dialog = InstallDialog(self, self.dep_manager)
+        self.wait_window(dialog)
+        if not dialog.success:
+            messagebox.showerror(
+                APP_NAME,
+                "Dependency installation failed. Please check your internet connection and try again.",
+            )
 
     # ── UI ──────────────────────────────────────────────
 
@@ -370,8 +650,8 @@ class AudioWhisperApp(TkinterDnD_CTk):
         )
         self.theme_btn.pack(side="right", padx=10)
 
-        device_color = "#4CAF50" if self.device == "cuda" else "#FF9800"
-        device_text = "GPU" if self.device == "cuda" else "CPU"
+        device_color = "#4CAF50" if self.has_gpu else "#FF9800"
+        device_text = "GPU" if self.has_gpu else "CPU"
         ctk.CTkLabel(
             header, text=device_text,
             text_color=device_color, font=("Segoe UI", 12, "bold"),
@@ -414,7 +694,7 @@ class AudioWhisperApp(TkinterDnD_CTk):
 
         btn_row = ctk.CTkFrame(controls, fg_color="transparent")
         btn_row.grid(row=0, column=0, sticky="ew", pady=(0, 10))
-        btn_row.grid_columnconfigure((0, 1, 2), weight=1)
+        btn_row.grid_columnconfigure((0, 1), weight=1)
 
         self.start_btn = ctk.CTkButton(
             btn_row, text="Start Transcription",
@@ -424,19 +704,12 @@ class AudioWhisperApp(TkinterDnD_CTk):
         )
         self.start_btn.grid(row=0, column=0, padx=5, sticky="ew")
 
-        self.pause_btn = ctk.CTkButton(
-            btn_row, text="Pause",
-            fg_color="#FFC107", text_color="black", hover_color="#FFD54F",
-            height=40, state="disabled", command=self._toggle_pause,
-        )
-        self.pause_btn.grid(row=0, column=1, padx=5, sticky="ew")
-
         self.stop_btn = ctk.CTkButton(
             btn_row, text="Stop",
             fg_color="#F44336", hover_color="#E57373",
             height=40, state="disabled", command=self._stop_transcription,
         )
-        self.stop_btn.grid(row=0, column=2, padx=5, sticky="ew")
+        self.stop_btn.grid(row=0, column=1, padx=5, sticky="ew")
 
         # Collapsible settings
         self.settings_group = CollapsibleFrame(controls, title="Advanced Settings")
@@ -527,6 +800,8 @@ class AudioWhisperApp(TkinterDnD_CTk):
 
     def _on_close(self):
         self._save_settings()
+        if self._worker_proc and self._worker_proc.poll() is None:
+            self._worker_proc.terminate()
         self.destroy()
 
     # ── Logging ─────────────────────────────────────────
@@ -546,194 +821,124 @@ class AudioWhisperApp(TkinterDnD_CTk):
                 self.status_msg.set(msg)
         self.after(100, self._poll_log_queue)
 
-    # ── Transcription ───────────────────────────────────
-
-    def _get_audio_duration(self, file_path):
-        try:
-            return librosa.get_duration(path=file_path)
-        except Exception:
-            return 0
-
-    def _extract_audio(self, video_path):
-        temp_audio = os.path.splitext(video_path)[0] + "_temp.wav"
-        try:
-            (
-                ffmpeg
-                .input(video_path)
-                .output(temp_audio, format="wav", acodec="pcm_s16le", ac=1, ar="16000")
-                .overwrite_output()
-                .run(quiet=True)
-            )
-            return temp_audio
-        except Exception as e:
-            raise RuntimeError(f"FFmpeg error: {e}")
-
-    def _run_transcription(self):
-        input_file = self.input_path.get()
-        output_folder = self.output_dir.get()
-        model_type = self.model_name.get()
-        temp_file = None
-        start_time = time.time()
-
-        try:
-            # Check FFmpeg for video files
-            is_video = input_file.lower().endswith((".mp4", ".avi", ".mov", ".mkv", ".webm"))
-            if is_video and not check_ffmpeg():
-                self._log("FFmpeg is required for video files. Install it: winget install ffmpeg")
-                return
-
-            self._log("Loading model (may download on first use)...")
-
-            total_duration = self._get_audio_duration(input_file)
-
-            try:
-                model = WhisperModel(model_type, device=self.device, compute_type=self.compute_type)
-            except Exception as e:
-                self._log(f"Model error: {e}")
-                return
-
-            if self.stop_event.is_set():
-                return
-
-            if is_video:
-                self._log("Extracting audio from video...")
-                temp_file = self._extract_audio(input_file)
-                process_file = temp_file
-                total_duration = self._get_audio_duration(process_file)
-            else:
-                process_file = input_file
-
-            if self.stop_event.is_set():
-                return
-
-            self._log("Transcribing...")
-            self.transcript_box.configure(state="normal")
-            self.transcript_box.delete("1.0", "end")
-            self.transcript_box.configure(state="disabled")
-
-            segments, info = model.transcribe(process_file, beam_size=5)
-            collected_segments = []
-
-            for segment in segments:
-                if self.stop_event.is_set():
-                    break
-                while self.pause_event.is_set():
-                    if self.stop_event.is_set():
-                        break
-                    time.sleep(0.1)
-
-                # Progress & ETA
-                if total_duration > 0:
-                    prog = min(segment.end / total_duration, 1.0)
-                    self.progress_val.set(prog)
-                    self.visualizer.set_progress(prog)
-                    elapsed = time.time() - start_time
-                    if prog > 0.01:
-                        remaining = (elapsed / prog) - elapsed
-                        mins, secs = divmod(int(remaining), 60)
-                        self.time_remaining_msg.set(f"~{mins:02}:{secs:02} remaining")
-
-                ts = f"[{int(segment.start // 3600):02}:{int((segment.start % 3600) // 60):02}:{int(segment.start % 60):02}]"
-                self._log(f"{ts} {segment.text.strip()}", is_transcript=True)
-                collected_segments.append(segment)
-
-            if self.stop_event.is_set() and not collected_segments:
-                self._log("Stopped.")
-                return
-
-            # Save
-            base_name = os.path.splitext(os.path.basename(input_file))[0]
-            if not output_folder:
-                output_folder = os.path.dirname(input_file)
-
-            txt_path = os.path.join(output_folder, f"{base_name}_transcript.txt")
-            with open(txt_path, "w", encoding="utf-8") as f:
-                for seg in collected_segments:
-                    if self.show_timestamps.get():
-                        f.write(f"[{seg.start:.2f}s] {seg.text.strip()}\n")
-                    else:
-                        f.write(f"{seg.text.strip()} ")
-
-            if self.export_srt.get():
-                srt_path = os.path.join(output_folder, f"{base_name}.srt")
-                with open(srt_path, "w", encoding="utf-8") as f:
-                    for i, seg in enumerate(collected_segments, start=1):
-                        s = self._format_srt_time(seg.start)
-                        e = self._format_srt_time(seg.end)
-                        f.write(f"{i}\n{s} --> {e}\n{seg.text.strip()}\n\n")
-
-            elapsed = time.time() - start_time
-            mins, secs = divmod(int(elapsed), 60)
-            self._log(f"Done — saved to {output_folder}  ({mins}m {secs}s)")
-            self.progress_val.set(1.0)
-            self.visualizer.set_progress(1.0)
-            self.time_remaining_msg.set("Complete")
-            self.open_folder_btn.configure(state="normal")
-
-        except Exception as e:
-            self._log(f"Error: {e}")
-        finally:
-            if temp_file and os.path.exists(temp_file):
-                os.remove(temp_file)
-            self.stop_event.clear()
-            self.pause_event.clear()
-            self.is_transcribing = False
-            self.is_paused = False
-            self._update_ui_state(transcribing=False)
-
-    def _format_srt_time(self, seconds):
-        total_sec = int(seconds)
-        millis = int((seconds - total_sec) * 1000)
-        hours, remainder = divmod(total_sec, 3600)
-        minutes, secs = divmod(remainder, 60)
-        return f"{hours:02}:{minutes:02}:{secs:02},{millis:03}"
+    # ── Transcription (subprocess) ──────────────────────
 
     def _start_transcription(self):
         if not self.input_path.get():
             messagebox.showwarning(APP_NAME, "Please select a file first.")
             return
 
+        # Ensure deps are installed
+        if not self.dep_manager.is_installed():
+            self._install_deps()
+            if not self.dep_manager.is_installed():
+                return
+
+        # Check FFmpeg for video files
+        is_video = self.input_path.get().lower().endswith((".mp4", ".avi", ".mov", ".mkv", ".webm"))
+        if is_video and not check_ffmpeg():
+            messagebox.showwarning(
+                APP_NAME,
+                "FFmpeg is required for video files.\nInstall it: winget install ffmpeg",
+            )
+            return
+
         self.is_transcribing = True
-        self.is_paused = False
         self.stop_event.clear()
-        self.pause_event.clear()
         self.progress_val.set(0)
         self.visualizer.set_progress(0)
         self.time_remaining_msg.set("Calculating...")
         self._update_ui_state(transcribing=True)
         self._save_settings()
-        threading.Thread(target=self._run_transcription, daemon=True).start()
+
+        self.transcript_box.configure(state="normal")
+        self.transcript_box.delete("1.0", "end")
+        self.transcript_box.configure(state="disabled")
+
+        threading.Thread(target=self._run_worker, daemon=True).start()
+
+    def _run_worker(self):
+        """Launch the transcription worker as a subprocess."""
+        python_exe = self.dep_manager.get_python_exe()
+        worker_path = self.dep_manager.get_worker_path()
+
+        cmd = [
+            python_exe, worker_path,
+            "--input", self.input_path.get(),
+            "--model", self.model_name.get(),
+            "--device", self.device,
+            "--compute_type", self.compute_type,
+        ]
+        if self.output_dir.get():
+            cmd.extend(["--output_dir", self.output_dir.get()])
+        if self.show_timestamps.get():
+            cmd.append("--timestamps")
+        if self.export_srt.get():
+            cmd.append("--export_srt")
+
+        try:
+            self._worker_proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, bufsize=1,
+            )
+
+            for line in self._worker_proc.stdout:
+                if self.stop_event.is_set():
+                    self._worker_proc.terminate()
+                    self._log("Stopped.")
+                    break
+
+                line = line.strip()
+                if not line:
+                    continue
+
+                try:
+                    msg = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                msg_type = msg.get("type")
+                if msg_type == "status":
+                    self._log(msg["msg"])
+                elif msg_type == "segment":
+                    self._log(f"{msg['timestamp']} {msg['text']}", is_transcript=True)
+                elif msg_type == "progress":
+                    self.progress_val.set(msg["value"])
+                    self.visualizer.set_progress(msg["value"])
+                    if msg.get("eta"):
+                        self.time_remaining_msg.set(msg["eta"])
+                elif msg_type == "done":
+                    self._log(msg["msg"])
+                    self.progress_val.set(1.0)
+                    self.visualizer.set_progress(1.0)
+                    self.time_remaining_msg.set("Complete")
+                    self.open_folder_btn.configure(state="normal")
+                elif msg_type == "error":
+                    self._log(f"Error: {msg['msg']}")
+
+            self._worker_proc.wait()
+
+        except Exception as e:
+            self._log(f"Error: {e}")
+        finally:
+            self._worker_proc = None
+            self.is_transcribing = False
+            self._update_ui_state(transcribing=False)
 
     def _stop_transcription(self):
         if self.is_transcribing:
             self.stop_event.set()
-            if self.pause_event.is_set():
-                self.pause_event.clear()
-
-    def _toggle_pause(self):
-        if not self.is_transcribing:
-            return
-        if self.is_paused:
-            self.is_paused = False
-            self.pause_event.clear()
-            self.pause_btn.configure(text="Pause", fg_color="#FFC107")
-            self.status_msg.set("Resumed...")
-        else:
-            self.is_paused = True
-            self.pause_event.set()
-            self.pause_btn.configure(text="Resume", fg_color="#00E676")
-            self.status_msg.set("Paused")
+            if self._worker_proc and self._worker_proc.poll() is None:
+                self._worker_proc.terminate()
 
     def _update_ui_state(self, transcribing):
         if transcribing:
             self.start_btn.configure(state="disabled")
             self.stop_btn.configure(state="normal")
-            self.pause_btn.configure(state="normal")
             self.open_folder_btn.configure(state="disabled")
         else:
             self.start_btn.configure(state="normal")
             self.stop_btn.configure(state="disabled")
-            self.pause_btn.configure(state="disabled", text="Pause", fg_color="#FFC107")
 
 
 # ──────────────────────────────────────────────────────────

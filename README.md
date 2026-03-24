@@ -42,16 +42,17 @@ Run the installer, launch the app, and start transcribing. That's it.
 ## How It Works
 
 1. **Install** — run the installer from the Releases page
-2. **Drop a file** — drag an audio or video file into the app (or click to browse)
-3. **Transcribe** — hit Start and watch the live transcript appear
-4. **Save** — output is saved as a `.txt` file (and `.srt` if enabled)
+2. **First launch** — the app will download and set up the transcription engine (~150 MB for CPU, ~2.5 GB for GPU). This only happens once and requires an internet connection.
+3. **Drop a file** — drag an audio or video file into the app (or click to browse)
+4. **Transcribe** — hit Start and watch the live transcript appear
+5. **Save** — output is saved as a `.txt` file (and `.srt` if enabled)
 
-The first time you use a model size, it will be downloaded automatically (~75 MB for `base`, up to ~3 GB for `large-v3`). This only happens once per model.
+The first time you use a model size, it will also be downloaded automatically (~75 MB for `base`, up to ~3 GB for `large-v3`).
 
 ## Building from Source
 
 ```bash
-pip install pyinstaller customtkinter tkinterdnd2 faster-whisper ffmpeg-python librosa soundfile numpy torch
+pip install pyinstaller customtkinter tkinterdnd2 librosa soundfile numpy
 python build.py
 ```
 

@@ -17,5 +17,4 @@ settings.json
 .idea/
 
 # Generated
-*.ico
 generate_icon.py
