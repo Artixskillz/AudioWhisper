@@ -148,6 +148,7 @@ class DependencyManager:
                     [self.python_exe, get_pip_path, "--no-warn-script-location"],
                     cwd=self.python_dir,
                     capture_output=True,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
                 )
                 if os.path.exists(get_pip_path):
                     os.remove(get_pip_path)
@@ -224,27 +225,71 @@ class DependencyManager:
                     progress_cb(pct)
 
     def _run_pip_with_progress(self, cmd, progress_cb, start_pct, end_pct, status_cb):
-        """Run a pip command and estimate progress from output."""
+        """Run a pip command with progress tracking and no visible console."""
+        # Use --progress-bar off for cleaner output parsing
+        full_cmd = cmd + ["--progress-bar", "off"]
+
         proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            full_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, cwd=self.python_dir,
+            creationflags=subprocess.CREATE_NO_WINDOW,
         )
+
         lines = []
+        step_count = 0
+        # Estimate total steps based on typical pip output
+        # (Collecting + Downloading + Installing = ~3 lines per package)
+        estimated_steps = 15  # rough guess, adjusts as we go
+
         for line in proc.stdout:
-            lines.append(line.strip())
-            # Parse pip download progress
-            match = re.search(r"(\d+)%", line)
-            if match:
-                pip_pct = int(match.group(1)) / 100.0
-                pct = start_pct + (end_pct - start_pct) * pip_pct
+            stripped = line.strip()
+            if not stripped:
+                continue
+            lines.append(stripped)
+
+            # Track meaningful pip events for progress
+            is_step = False
+
+            if stripped.startswith("Collecting"):
+                # "Collecting torch" → show package name
+                pkg_name = stripped.split("Collecting")[-1].strip().split()[0]
+                status_cb(f"Downloading {pkg_name}...")
+                is_step = True
+
+            elif stripped.startswith("Downloading"):
+                # "Downloading torch-2.4.0-cp311-..whl (150.3 MB)"
+                size_match = re.search(r"\(([0-9.]+\s*[kKmMgG][bB])\)", stripped)
+                pkg_match = re.search(r"Downloading\s+(\S+)", stripped)
+                pkg_name = ""
+                if pkg_match:
+                    # Extract just the package name from the URL/filename
+                    raw = pkg_match.group(1).split("/")[-1]
+                    pkg_name = raw.split("-")[0]
+                size_str = size_match.group(1) if size_match else ""
+                if size_str:
+                    status_cb(f"Downloading {pkg_name} ({size_str})...")
+                else:
+                    status_cb(f"Downloading {pkg_name}...")
+                is_step = True
+
+            elif stripped.startswith("Installing collected"):
+                status_cb("Installing packages...")
+                is_step = True
+
+            elif stripped.startswith("Successfully installed"):
+                status_cb("Packages installed")
+                is_step = True
+
+            if is_step:
+                step_count += 1
+                estimated_steps = max(estimated_steps, step_count + 2)
+                pct = start_pct + (end_pct - start_pct) * min(step_count / estimated_steps, 0.95)
                 progress_cb(pct)
-            # Show what's being installed
-            if line.strip().startswith("Collecting") or line.strip().startswith("Downloading"):
-                pkg = line.strip().split()[-1] if line.strip().split() else ""
-                status_cb(f"Installing: {pkg}")
+
         proc.wait()
         if proc.returncode != 0:
-            raise RuntimeError(f"pip install failed:\n{''.join(lines[-10:])}")
+            error_lines = "\n".join(lines[-15:])
+            raise RuntimeError(f"pip install failed:\n{error_lines}")
         progress_cb(end_pct)
 
 
@@ -880,6 +925,7 @@ class AudioWhisperApp(TkinterDnD_CTk):
             self._worker_proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, bufsize=1,
+                creationflags=subprocess.CREATE_NO_WINDOW,
             )
 
             for line in self._worker_proc.stdout:
