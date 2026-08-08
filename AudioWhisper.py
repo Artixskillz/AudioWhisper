@@ -6,37 +6,35 @@ import time
 import queue
 import json
 import shutil
-import urllib.request
-import zipfile
 import re
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
-import numpy as np
 import customtkinter as ctk
 from tkinterdnd2 import DND_FILES, TkinterDnD
-import librosa
 
 # ──────────────────────────────────────────────────────────
 #  Configuration
 # ──────────────────────────────────────────────────────────
 
 APP_NAME = "AudioWhisper"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 
 MODELS = {
-    "tiny":     "Fastest — low accuracy, good for quick drafts",
-    "base":     "Fast — decent accuracy for clear audio",
-    "small":    "Balanced — good accuracy, moderate speed",
-    "medium":   "Accurate — slower, great for most use cases",
-    "large-v3": "Best — highest accuracy, requires more RAM/VRAM",
+    "tiny":     "Fastest — low accuracy, good for quick drafts (75 MB)",
+    "base":     "Fast — decent accuracy for clear audio (145 MB)",
+    "small":    "Balanced — good accuracy, moderate speed (480 MB)",
+    "medium":   "Accurate — slower, great for most use cases (1.5 GB)",
+    "large-v3": "Best — highest accuracy, needs a powerful PC (3 GB)",
 }
 
 SUPPORTED_FORMATS = "*.mp3 *.wav *.m4a *.flac *.ogg *.wma *.aac *.mp4 *.avi *.mov *.mkv *.webm"
 
-PYTHON_EMBED_URL = "https://www.python.org/ftp/python/3.11.9/python-3.11.9-embed-amd64.zip"
+# Legacy v1.0 runtime location (Roaming AppData)
 PYTHON_EMBED_DIR = "python-3.11.9-embed"
-GET_PIP_URL = "https://bootstrap.pypa.io/get-pip.py"
+
+# Optional GPU acceleration packages (installed on demand into the runtime)
+GPU_PACKAGES = ["nvidia-cublas-cu12==12.9.2.10", "nvidia-cudnn-cu12==9.24.0.43"]
 
 ctk.set_appearance_mode("System")
 ctk.set_default_color_theme("blue")
@@ -44,16 +42,23 @@ ctk.set_default_color_theme("blue")
 
 def get_app_data_dir():
     if sys.platform == "win32":
-        base = os.environ.get("APPDATA", os.path.expanduser("~"))
+        base = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
     else:
         base = os.path.expanduser("~/.config")
     path = os.path.join(base, APP_NAME)
     os.makedirs(path, exist_ok=True)
+
+    # One-time migration of settings from the v1.0 Roaming location
+    if sys.platform == "win32":
+        new_settings = os.path.join(path, "settings.json")
+        old_settings = os.path.join(
+            os.environ.get("APPDATA", ""), APP_NAME, "settings.json")
+        if not os.path.exists(new_settings) and os.path.exists(old_settings):
+            try:
+                shutil.copy2(old_settings, new_settings)
+            except Exception:
+                pass
     return path
-
-
-def check_ffmpeg():
-    return shutil.which("ffmpeg") is not None
 
 
 def _resource_path(filename):
@@ -65,219 +70,162 @@ def _resource_path(filename):
     return os.path.join(base, filename)
 
 
+def _exe_dir():
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
 # ──────────────────────────────────────────────────────────
-#  Dependency Manager
+#  Runtime Manager
 # ──────────────────────────────────────────────────────────
 
-class DependencyManager:
-    """Manages the embedded Python environment and heavy dependencies."""
+class RuntimeManager:
+    """Locates the bundled Python runtime and manages the optional GPU add-on.
+
+    The transcription engine ships inside the installer (in the `runtime`
+    folder next to the EXE), so there is nothing to download on first run
+    except the Whisper model itself.
+    """
 
     def __init__(self, app_data_dir):
         self.app_data_dir = app_data_dir
-        self.python_dir = os.path.join(app_data_dir, PYTHON_EMBED_DIR)
+        candidates = [
+            os.path.join(_exe_dir(), "runtime"),
+            # Legacy v1.0 install location
+            os.path.join(os.environ.get("APPDATA", ""), APP_NAME, PYTHON_EMBED_DIR),
+        ]
+        self.python_dir = next(
+            (c for c in candidates if os.path.exists(os.path.join(c, "python.exe"))),
+            candidates[0],
+        )
         self.python_exe = os.path.join(self.python_dir, "python.exe")
-        self.worker_path = os.path.join(app_data_dir, "transcribe_worker.py")
-        self.marker_file = os.path.join(app_data_dir, "deps_installed.json")
+        self.is_bundled = self.python_dir == candidates[0]
+        self.gpu_marker = os.path.join(app_data_dir, "gpu_installed.json")
+        self.install_log = os.path.join(app_data_dir, "install.log")
+        self._pip_proc = None
 
-    def is_installed(self):
-        if not os.path.exists(self.marker_file):
-            return False
-        try:
-            with open(self.marker_file) as f:
-                data = json.load(f)
-            return data.get("version") == APP_VERSION
-        except Exception:
-            return False
+    def kill_pip(self):
+        """Kill any in-flight pip install (called on app close)."""
+        proc = self._pip_proc
+        if proc and proc.poll() is None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    def runtime_ok(self):
+        return os.path.exists(self.python_exe)
 
     def has_gpu(self):
         """Check for NVIDIA GPU by looking for nvidia-smi."""
         return shutil.which("nvidia-smi") is not None
 
-    def get_python_exe(self):
-        return self.python_exe
+    def _nvidia_dir(self):
+        return os.path.join(self.python_dir, "Lib", "site-packages", "nvidia")
 
-    def get_worker_path(self):
-        return self.worker_path
+    def gpu_dll_dirs(self):
+        base = self._nvidia_dir()
+        return [os.path.join(base, "cublas", "bin"),
+                os.path.join(base, "cudnn", "bin")]
 
-    def install(self, progress_callback=None, status_callback=None):
-        """Download and install the embedded Python + heavy deps."""
-        def status(msg):
-            if status_callback:
-                status_callback(msg)
-
-        def progress(pct):
-            if progress_callback:
-                progress_callback(pct)
-
-        try:
-            # Step 1: Download embedded Python
-            status("Downloading Python runtime...")
-            progress(0.0)
-            zip_path = os.path.join(self.app_data_dir, "python_embed.zip")
-
-            if not os.path.exists(self.python_exe):
-                self._download_file(PYTHON_EMBED_URL, zip_path, progress, 0.0, 0.1)
-
-                # Extract
-                status("Extracting Python runtime...")
-                os.makedirs(self.python_dir, exist_ok=True)
-                with zipfile.ZipFile(zip_path, "r") as zf:
-                    zf.extractall(self.python_dir)
-                os.remove(zip_path)
-
-                # Enable site-packages by editing ._pth file
-                for f in os.listdir(self.python_dir):
-                    if f.endswith("._pth"):
-                        pth_path = os.path.join(self.python_dir, f)
-                        with open(pth_path, "r") as fh:
-                            content = fh.read()
-                        content = content.replace("#import site", "import site")
-                        with open(pth_path, "w") as fh:
-                            fh.write(content)
-                        break
-
-            progress(0.1)
-
-            # Step 2: Install pip
-            status("Setting up pip...")
-            pip_exe = os.path.join(self.python_dir, "Scripts", "pip.exe")
-            if not os.path.exists(pip_exe):
-                get_pip_path = os.path.join(self.app_data_dir, "get-pip.py")
-                self._download_file(GET_PIP_URL, get_pip_path, progress, 0.1, 0.15)
-                subprocess.run(
-                    [self.python_exe, get_pip_path, "--no-warn-script-location"],
-                    cwd=self.python_dir,
-                    capture_output=True,
-                    creationflags=subprocess.CREATE_NO_WINDOW,
-                )
-                if os.path.exists(get_pip_path):
-                    os.remove(get_pip_path)
-
-            progress(0.15)
-
-            # Step 3: Install torch
-            use_gpu = self.has_gpu()
-            if use_gpu:
-                status("Installing PyTorch with GPU support (this may take a while)...")
-                torch_cmd = [
-                    self.python_exe, "-m", "pip", "install",
-                    "torch", "--no-warn-script-location",
-                    "--index-url", "https://download.pytorch.org/whl/cu124",
-                ]
-            else:
-                status("Installing PyTorch (CPU)...")
-                torch_cmd = [
-                    self.python_exe, "-m", "pip", "install",
-                    "torch", "--no-warn-script-location",
-                    "--index-url", "https://download.pytorch.org/whl/cpu",
-                ]
-
-            self._run_pip_with_progress(torch_cmd, progress, 0.15, 0.75, status)
-
-            # Step 4: Install faster-whisper and audio deps
-            status("Installing transcription engine...")
-            whisper_cmd = [
-                self.python_exe, "-m", "pip", "install",
-                "faster-whisper", "ffmpeg-python", "librosa", "soundfile",
-                "--no-warn-script-location",
-            ]
-            self._run_pip_with_progress(whisper_cmd, progress, 0.75, 0.95, status)
-
-            progress(0.95)
-
-            # Step 5: Deploy worker script
-            status("Finalizing setup...")
-            worker_src = _resource_path("transcribe_worker.py")
-            shutil.copy2(worker_src, self.worker_path)
-
-            # Mark as complete
-            with open(self.marker_file, "w") as f:
-                json.dump({"version": APP_VERSION, "gpu": use_gpu}, f)
-
-            progress(1.0)
-            status("Setup complete!")
-            return True
-
-        except Exception as e:
-            status(f"Installation failed: {e}")
-            # Clean up partial install so next attempt starts fresh
-            if os.path.exists(self.marker_file):
-                os.remove(self.marker_file)
+    def gpu_ready(self):
+        if not os.path.exists(self.gpu_marker):
             return False
+        return all(os.path.isdir(d) for d in self.gpu_dll_dirs())
 
-    def _download_file(self, url, dest, progress_cb, start_pct, end_pct):
-        """Download a file with progress reporting and timeout."""
+    def worker_env(self):
+        """Environment for worker/probe subprocesses."""
+        env = os.environ.copy()
+        env["HF_HOME"] = os.path.join(self.app_data_dir, "models")
+        env["PYTHONIOENCODING"] = "utf-8"
+        if self.gpu_ready():
+            env["PATH"] = os.pathsep.join(self.gpu_dll_dirs()) + os.pathsep + env.get("PATH", "")
+        return env
+
+    # ── GPU add-on installation ─────────────────────────
+
+    def install_gpu(self, progress_cb, status_cb, cancel_event):
+        """Install CUDA libraries into the runtime. Returns (ok, error_msg)."""
+        log_lines = []
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "AudioWhisper/1.0"})
-            response = urllib.request.urlopen(req, timeout=30)
+            free_gb = shutil.disk_usage(self.python_dir).free / (1024 ** 3)
+            if free_gb < 4:
+                raise RuntimeError(
+                    f"Not enough disk space — need about 4 GB free, "
+                    f"but only {free_gb:.1f} GB is available.")
+
+            status_cb("Downloading GPU libraries...")
+            cmd = [
+                self.python_exe, "-m", "pip", "install",
+                "--no-cache-dir", "--no-warn-script-location",
+            ] + GPU_PACKAGES
+            self._run_pip(cmd, progress_cb, status_cb, cancel_event, log_lines)
+
+            if cancel_event.is_set():
+                return False, "cancelled"
+
+            with open(self.gpu_marker, "w") as f:
+                json.dump({"packages": GPU_PACKAGES, "version": APP_VERSION}, f)
+            progress_cb(1.0)
+            status_cb("GPU acceleration ready!")
+            return True, ""
+
         except Exception as e:
-            raise RuntimeError(
-                f"Download failed — check your internet connection.\n{e}"
-            )
+            if cancel_event.is_set():
+                return False, "cancelled"
+            self._write_log(log_lines, e)
+            return False, str(e)
 
-        total = int(response.headers.get("Content-Length", 0))
-        downloaded = 0
-        block_size = 65536
-
-        with open(dest, "wb") as f:
-            while True:
-                try:
-                    chunk = response.read(block_size)
-                except Exception as e:
-                    # Clean up partial file
-                    f.close()
-                    if os.path.exists(dest):
-                        os.remove(dest)
-                    raise RuntimeError(
-                        f"Download interrupted — check your internet connection.\n{e}"
-                    )
-                if not chunk:
-                    break
-                f.write(chunk)
-                downloaded += len(chunk)
-                if total > 0:
-                    pct = start_pct + (end_pct - start_pct) * min(downloaded / total, 1.0)
-                    progress_cb(pct)
-
-    def _run_pip_with_progress(self, cmd, progress_cb, start_pct, end_pct, status_cb):
+    def _run_pip(self, cmd, progress_cb, status_cb, cancel_event, log_lines):
         """Run a pip command with progress tracking and no visible console."""
-        # Use --progress-bar off for cleaner output parsing
         full_cmd = cmd + ["--progress-bar", "off"]
 
         proc = subprocess.Popen(
             full_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, cwd=self.python_dir,
+            text=True, encoding="utf-8", errors="replace", cwd=self.python_dir,
             creationflags=subprocess.CREATE_NO_WINDOW,
         )
+        self._pip_proc = proc
 
-        lines = []
+        # pip is silent for minutes during large wheel downloads, so the
+        # stdout loop can't see the cancel flag — a watchdog kills pip
+        # the moment cancel is requested
+        def _watchdog():
+            while proc.poll() is None:
+                if cancel_event.wait(0.5):
+                    if proc.poll() is None:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                    return
+
+        threading.Thread(target=_watchdog, daemon=True).start()
+
         step_count = 0
-        # Estimate total steps based on typical pip output
-        # (Collecting + Downloading + Installing = ~3 lines per package)
-        estimated_steps = 15  # rough guess, adjusts as we go
+        estimated_steps = 8
 
         for line in proc.stdout:
+            if cancel_event.is_set():
+                proc.wait()
+                self._pip_proc = None
+                return
             stripped = line.strip()
             if not stripped:
                 continue
-            lines.append(stripped)
+            log_lines.append(stripped)
 
-            # Track meaningful pip events for progress
             is_step = False
-
             if stripped.startswith("Collecting"):
-                # "Collecting torch" → show package name
                 pkg_name = stripped.split("Collecting")[-1].strip().split()[0]
                 status_cb(f"Downloading {pkg_name}...")
                 is_step = True
-
             elif stripped.startswith("Downloading"):
-                # "Downloading torch-2.4.0-cp311-..whl (150.3 MB)"
                 size_match = re.search(r"\(([0-9.]+\s*[kKmMgG][bB])\)", stripped)
                 pkg_match = re.search(r"Downloading\s+(\S+)", stripped)
                 pkg_name = ""
                 if pkg_match:
-                    # Extract just the package name from the URL/filename
                     raw = pkg_match.group(1).split("/")[-1]
                     pkg_name = raw.split("-")[0]
                 size_str = size_match.group(1) if size_match else ""
@@ -286,11 +234,9 @@ class DependencyManager:
                 else:
                     status_cb(f"Downloading {pkg_name}...")
                 is_step = True
-
             elif stripped.startswith("Installing collected"):
                 status_cb("Installing packages...")
                 is_step = True
-
             elif stripped.startswith("Successfully installed"):
                 status_cb("Packages installed")
                 is_step = True
@@ -298,14 +244,43 @@ class DependencyManager:
             if is_step:
                 step_count += 1
                 estimated_steps = max(estimated_steps, step_count + 2)
-                pct = start_pct + (end_pct - start_pct) * min(step_count / estimated_steps, 0.95)
-                progress_cb(pct)
+                progress_cb(min(step_count / estimated_steps, 0.95))
 
         proc.wait()
-        if proc.returncode != 0:
-            error_lines = "\n".join(lines[-15:])
+        self._pip_proc = None
+        if proc.returncode != 0 and not cancel_event.is_set():
+            error_lines = "\n".join(log_lines[-15:])
             raise RuntimeError(f"pip install failed:\n{error_lines}")
-        progress_cb(end_pct)
+
+    def _write_log(self, log_lines, error):
+        try:
+            with open(self.install_log, "w", encoding="utf-8") as f:
+                f.write(f"{APP_NAME} {APP_VERSION} — GPU install log\n")
+                f.write(f"Error: {error}\n\n")
+                f.write("\n".join(log_lines))
+        except Exception:
+            pass
+
+    # ── Legacy v1.0 cleanup ─────────────────────────────
+
+    def legacy_runtime_dir(self):
+        """Return the old v1.0 runtime dir if it exists and isn't in use."""
+        if not self.is_bundled:
+            return None
+        legacy = os.path.join(os.environ.get("APPDATA", ""), APP_NAME, PYTHON_EMBED_DIR)
+        return legacy if os.path.isdir(legacy) else None
+
+    def remove_legacy_runtime(self):
+        legacy_root = os.path.join(os.environ.get("APPDATA", ""), APP_NAME)
+        for name in (PYTHON_EMBED_DIR, "deps_installed.json", "transcribe_worker.py"):
+            target = os.path.join(legacy_root, name)
+            try:
+                if os.path.isdir(target):
+                    shutil.rmtree(target, ignore_errors=True)
+                elif os.path.exists(target):
+                    os.remove(target)
+            except Exception:
+                pass
 
 
 # ──────────────────────────────────────────────────────────
@@ -317,26 +292,18 @@ class WaveformVisualizer(ctk.CTkCanvas):
         super().__init__(master, width=width, height=height, highlightthickness=0)
         self.configure(bg=bg_color or "gray20")
         self.bars = 100
-        self.amplitudes = np.zeros(self.bars)
+        self.amplitudes = [0.0] * self.bars
         self._width = width
         self._height = height
         self.bar_width = width / self.bars
         self.progress = 0.0
 
-    def load_audio(self, file_path):
-        try:
-            y, sr = librosa.load(file_path, sr=4000, duration=30)
-            chunk_size = max(len(y) // self.bars, 1)
-            new_amps = []
-            for i in range(self.bars):
-                start = i * chunk_size
-                chunk = y[start:start + chunk_size]
-                new_amps.append(np.max(np.abs(chunk)) if len(chunk) > 0 else 0)
-            max_val = max(new_amps) if max(new_amps) > 0 else 1
-            self.amplitudes = np.array(new_amps) / max_val
-            self.draw()
-        except Exception:
-            pass
+    def set_amplitudes(self, peaks):
+        """Set waveform peaks (list of 0..1 floats) and redraw."""
+        amps = list(peaks)[:self.bars]
+        amps += [0.0] * (self.bars - len(amps))
+        self.amplitudes = amps
+        self.draw()
 
     def set_progress(self, progress):
         self.progress = progress
@@ -354,7 +321,7 @@ class WaveformVisualizer(ctk.CTkCanvas):
             self.create_rectangle(x1, y1, x2, y2, fill=color, outline="")
 
     def reset(self):
-        self.amplitudes = np.zeros(self.bars)
+        self.amplitudes = [0.0] * self.bars
         self.progress = 0.0
         self.draw()
 
@@ -420,16 +387,16 @@ class DropZone(ctk.CTkFrame):
 
 
 # ──────────────────────────────────────────────────────────
-#  Dependency Install Dialog
+#  GPU Install Dialog
 # ──────────────────────────────────────────────────────────
 
-class InstallDialog(ctk.CTkToplevel):
-    """Shows progress while installing dependencies."""
+class GpuInstallDialog(ctk.CTkToplevel):
+    """Shows progress while installing the optional GPU acceleration."""
 
-    def __init__(self, parent, dep_manager):
+    def __init__(self, parent, runtime_mgr):
         super().__init__(parent)
-        self.title(f"{APP_NAME} — Installing")
-        self.geometry("500x280")
+        self.title(f"{APP_NAME} — GPU Setup")
+        self.geometry("500x300")
         self.resizable(False, False)
         try:
             self.after(200, lambda: self.iconbitmap(_resource_path("AudioWhisper.ico")))
@@ -437,22 +404,24 @@ class InstallDialog(ctk.CTkToplevel):
             pass
         self.transient(parent)
         self.grab_set()
-        self.dep_manager = dep_manager
+        self.runtime_mgr = runtime_mgr
         self.success = False
+        self.error = ""
+        self._cancel_event = threading.Event()
 
         self.update_idletasks()
         x = (self.winfo_screenwidth() - 500) // 2
-        y = (self.winfo_screenheight() - 280) // 2
+        y = (self.winfo_screenheight() - 300) // 2
         self.geometry(f"+{x}+{y}")
 
         ctk.CTkLabel(
-            self, text="Setting up AudioWhisper",
+            self, text="Setting up GPU Acceleration",
             font=("Segoe UI", 20, "bold"),
         ).pack(pady=(25, 5))
 
         ctk.CTkLabel(
             self,
-            text="Downloading and installing the transcription engine.\nThis only happens once.",
+            text="Downloading NVIDIA CUDA libraries (~1 GB).\nThis only happens once — transcription will be 5-10x faster.",
             font=("Segoe UI", 12), text_color="gray60", justify="center",
         ).pack(pady=(0, 20))
 
@@ -472,11 +441,23 @@ class InstallDialog(ctk.CTkToplevel):
         )
         self.pct_label.pack()
 
-        self.protocol("WM_DELETE_WINDOW", lambda: None)  # Prevent closing during install
+        self.cancel_btn = ctk.CTkButton(
+            self, text="Cancel", width=100,
+            fg_color="gray40", hover_color="gray30",
+            command=self._cancel,
+        )
+        self.cancel_btn.pack(pady=(10, 0))
+
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
 
         self._msg_queue = queue.Queue()
         self.after(100, self._poll_queue)
         threading.Thread(target=self._run_install, daemon=True).start()
+
+    def _cancel(self):
+        self._cancel_event.set()
+        self.status_var.set("Cancelling...")
+        self.cancel_btn.configure(state="disabled")
 
     def _run_install(self):
         def on_progress(pct):
@@ -485,11 +466,9 @@ class InstallDialog(ctk.CTkToplevel):
         def on_status(msg):
             self._msg_queue.put(("status", msg))
 
-        result = self.dep_manager.install(
-            progress_callback=on_progress,
-            status_callback=on_status,
-        )
-        self._msg_queue.put(("done", result))
+        ok, err = self.runtime_mgr.install_gpu(
+            on_progress, on_status, self._cancel_event)
+        self._msg_queue.put(("done", (ok, err)))
 
     def _poll_queue(self):
         while not self._msg_queue.empty():
@@ -500,7 +479,7 @@ class InstallDialog(ctk.CTkToplevel):
             elif kind == "status":
                 self.status_var.set(value)
             elif kind == "done":
-                self.success = value
+                self.success, self.error = value
                 self.destroy()
                 return
         self.after(100, self._poll_queue)
@@ -513,10 +492,10 @@ class InstallDialog(ctk.CTkToplevel):
 class SetupDialog(ctk.CTkToplevel):
     """Shown on first launch to welcome the user and pick defaults."""
 
-    def __init__(self, parent, settings, has_gpu):
+    def __init__(self, parent, settings, offer_gpu):
         super().__init__(parent)
         self.title(f"{APP_NAME} — Setup")
-        self.geometry("520x480")
+        self.geometry("540x520")
         self.resizable(False, False)
         try:
             self.after(200, lambda: self.iconbitmap(_resource_path("AudioWhisper.ico")))
@@ -528,8 +507,8 @@ class SetupDialog(ctk.CTkToplevel):
         self.result = None
 
         self.update_idletasks()
-        x = (self.winfo_screenwidth() - 520) // 2
-        y = (self.winfo_screenheight() - 480) // 2
+        x = (self.winfo_screenwidth() - 540) // 2
+        y = (self.winfo_screenheight() - 520) // 2
         self.geometry(f"+{x}+{y}")
 
         ctk.CTkLabel(
@@ -539,15 +518,8 @@ class SetupDialog(ctk.CTkToplevel):
 
         ctk.CTkLabel(
             self,
-            text="Free, private, offline audio & video transcription.\nEverything runs on your machine — nothing is uploaded.",
+            text="Free, private audio & video transcription.\nEverything runs on your machine — nothing is uploaded.",
             font=("Segoe UI", 13), text_color="gray60", justify="center",
-        ).pack(pady=(0, 20))
-
-        device = "NVIDIA GPU (CUDA)" if has_gpu else "CPU"
-        device_color = "#4CAF50" if has_gpu else "#FF9800"
-        ctk.CTkLabel(
-            self, text=f"Detected hardware:  {device}",
-            font=("Segoe UI", 13, "bold"), text_color=device_color,
         ).pack(pady=(0, 20))
 
         ctk.CTkLabel(
@@ -564,29 +536,45 @@ class SetupDialog(ctk.CTkToplevel):
 
         ctk.CTkLabel(
             self,
-            text="The model will be downloaded automatically on first use.\nYou can change this later in Advanced Settings.",
+            text="The model downloads automatically the first time you transcribe.\nYou can change it later in Advanced Settings.",
             font=("Segoe UI", 11), text_color="gray50", justify="center",
         ).pack(pady=(15, 10))
 
-        if not check_ffmpeg():
-            ctk.CTkLabel(
+        self.gpu_var = ctk.BooleanVar(value=offer_gpu)
+        if offer_gpu:
+            ctk.CTkCheckBox(
                 self,
-                text="FFmpeg not found — video files won't work.\n"
-                     "Install it:  winget install ffmpeg",
-                font=("Segoe UI", 12, "bold"), text_color="#F44336", justify="center",
+                text="Enable GPU acceleration (~1 GB download, 5-10x faster)",
+                variable=self.gpu_var, font=("Segoe UI", 12, "bold"),
             ).pack(pady=(5, 5))
+            ctk.CTkLabel(
+                self, text="NVIDIA GPU detected — recommended",
+                font=("Segoe UI", 11), text_color="#4CAF50",
+            ).pack()
 
         ctk.CTkButton(
             self, text="Get Started", width=200, height=40,
             font=("Segoe UI", 14, "bold"),
             fg_color="#4CAF50", hover_color="#388E3C",
             command=self._finish,
-        ).pack(pady=(10, 20))
+        ).pack(pady=(15, 20))
 
-        self.protocol("WM_DELETE_WINDOW", self._finish)
+        # Closing via the titlebar X keeps the model choice but must not
+        # kick off the ~1 GB GPU download — that needs an explicit click
+        self.protocol("WM_DELETE_WINDOW", self._dismiss)
 
     def _finish(self):
-        self.result = self.model_var.get()
+        self.result = {
+            "model": self.model_var.get(),
+            "install_gpu": self.gpu_var.get(),
+        }
+        self.destroy()
+
+    def _dismiss(self):
+        self.result = {
+            "model": self.model_var.get(),
+            "install_gpu": False,
+        }
         self.destroy()
 
 
@@ -617,7 +605,7 @@ class AudioWhisperApp(TkinterDnD_CTk):
         # Paths & managers
         self.app_data_dir = get_app_data_dir()
         self.settings_file = os.path.join(self.app_data_dir, "settings.json")
-        self.dep_manager = DependencyManager(self.app_data_dir)
+        self.runtime_mgr = RuntimeManager(self.app_data_dir)
 
         # State
         self.input_path = ctk.StringVar()
@@ -628,6 +616,7 @@ class AudioWhisperApp(TkinterDnD_CTk):
         self.status_msg = ctk.StringVar(value="Ready")
         self.progress_val = ctk.DoubleVar(value=0.0)
         self.time_remaining_msg = ctk.StringVar(value="")
+        self.device_label_var = ctk.StringVar(value="CPU")
 
         self.is_transcribing = False
         self.stop_event = threading.Event()
@@ -644,13 +633,9 @@ class AudioWhisperApp(TkinterDnD_CTk):
         self.show_timestamps.set(self.settings.get("timestamps", True))
         self.export_srt.set(self.settings.get("export_srt", False))
 
-        # Device detection (lightweight — just check nvidia-smi)
-        self.has_gpu = self.dep_manager.has_gpu()
-        self.device = "cuda" if self.has_gpu else "cpu"
-        self.compute_type = "float16" if self.has_gpu else "float32"
-
         # Build UI
         self._create_widgets()
+        self._refresh_device_label()
 
         # Drag & drop
         self.drop_target_register(DND_FILES)
@@ -662,6 +647,16 @@ class AudioWhisperApp(TkinterDnD_CTk):
         # First-run setup
         if not self.settings.get("setup_complete"):
             self.after(200, self._show_setup)
+        else:
+            self.after(1000, self._offer_legacy_cleanup)
+
+        # Sanity check: the runtime ships with the installer
+        if not self.runtime_mgr.runtime_ok():
+            self.after(400, lambda: messagebox.showerror(
+                APP_NAME,
+                "The AudioWhisper runtime folder is missing.\n"
+                "Please reinstall AudioWhisper to fix this.",
+            ))
 
     # ── Settings ────────────────────────────────────────
 
@@ -675,40 +670,90 @@ class AudioWhisperApp(TkinterDnD_CTk):
         return {}
 
     def _save_settings(self):
-        data = {
+        self.settings.update({
             "model": self.model_name.get(),
             "output_dir": self.output_dir.get(),
             "timestamps": self.show_timestamps.get(),
             "export_srt": self.export_srt.get(),
             "setup_complete": True,
-        }
+        })
         try:
             with open(self.settings_file, "w") as f:
-                json.dump(data, f, indent=2)
+                json.dump(self.settings, f, indent=2)
         except Exception:
             pass
 
     # ── First-run ───────────────────────────────────────
 
     def _show_setup(self):
-        dialog = SetupDialog(self, self.settings, self.has_gpu)
+        offer_gpu = self.runtime_mgr.has_gpu() and not self.runtime_mgr.gpu_ready()
+        dialog = SetupDialog(self, self.settings, offer_gpu)
         self.wait_window(dialog)
         if dialog.result:
-            self.model_name.set(dialog.result)
+            self.model_name.set(dialog.result["model"])
         self._save_settings()
 
-        # Install dependencies if needed
-        if not self.dep_manager.is_installed():
-            self._install_deps()
+        if dialog.result and dialog.result.get("install_gpu"):
+            self._install_gpu()
 
-    def _install_deps(self):
-        dialog = InstallDialog(self, self.dep_manager)
+        self._offer_legacy_cleanup()
+
+    def _install_gpu(self):
+        dialog = GpuInstallDialog(self, self.runtime_mgr)
         self.wait_window(dialog)
-        if not dialog.success:
+        if dialog.success:
+            self._refresh_device_label()
+            messagebox.showinfo(
+                APP_NAME, "GPU acceleration is ready!\nTranscriptions will now use your NVIDIA GPU.")
+        elif dialog.error and dialog.error != "cancelled":
             messagebox.showerror(
                 APP_NAME,
-                "Dependency installation failed. Please check your internet connection and try again.",
+                f"GPU setup didn't finish:\n{dialog.error[:400]}\n\n"
+                f"Details saved to:\n{self.runtime_mgr.install_log}\n\n"
+                "Don't worry — transcription still works on CPU.\n"
+                "You can retry from Advanced Settings anytime.",
             )
+
+    def _offer_legacy_cleanup(self):
+        """Offer to remove the old v1.0 downloaded runtime (~5 GB)."""
+        if self.settings.get("legacy_cleanup_done"):
+            return
+        legacy = self.runtime_mgr.legacy_runtime_dir()
+        if not legacy:
+            return
+        if not messagebox.askyesno(
+            APP_NAME,
+            "AudioWhisper found a large leftover folder from an old version\n"
+            "(about 5 GB) that is no longer needed.\n\nRemove it now to free up disk space?",
+        ):
+            # Respect the "no" — don't ask again
+            self.settings["legacy_cleanup_done"] = True
+            self._save_settings()
+            return
+
+        def _cleanup():
+            self.runtime_mgr.remove_legacy_runtime()
+            # Only mark done if it actually worked, so a locked file
+            # (AV scan, open Explorer window) gets another chance later
+            if not self.runtime_mgr.legacy_runtime_dir():
+                def mark():
+                    self.settings["legacy_cleanup_done"] = True
+                    self._save_settings()
+                    self.status_msg.set("Old version cleaned up — 5 GB freed.")
+                self.after(0, mark)
+
+        threading.Thread(target=_cleanup, daemon=True).start()
+
+    def _refresh_device_label(self):
+        # Same predicate _run_worker uses to pick the device
+        if self.runtime_mgr.gpu_ready() and self.runtime_mgr.has_gpu():
+            self.device_label_var.set("GPU")
+            self.device_label.configure(text_color="#4CAF50")
+            if hasattr(self, "gpu_btn"):
+                self.gpu_btn.grid_remove()
+        else:
+            self.device_label_var.set("CPU")
+            self.device_label.configure(text_color="#FF9800")
 
     # ── UI ──────────────────────────────────────────────
 
@@ -726,12 +771,11 @@ class AudioWhisperApp(TkinterDnD_CTk):
         )
         self.theme_btn.pack(side="right", padx=10)
 
-        device_color = "#4CAF50" if self.has_gpu else "#FF9800"
-        device_text = "GPU" if self.has_gpu else "CPU"
-        ctk.CTkLabel(
-            header, text=device_text,
-            text_color=device_color, font=("Segoe UI", 12, "bold"),
-        ).pack(side="right")
+        self.device_label = ctk.CTkLabel(
+            header, textvariable=self.device_label_var,
+            text_color="#FF9800", font=("Segoe UI", 12, "bold"),
+        )
+        self.device_label.pack(side="right")
 
         # Drop zone
         self.drop_zone = DropZone(self, command=self._browse_input)
@@ -804,6 +848,14 @@ class AudioWhisperApp(TkinterDnD_CTk):
         ctk.CTkSwitch(sf, text="Timestamps", variable=self.show_timestamps).grid(row=2, column=0, padx=10, pady=5, sticky="w")
         ctk.CTkSwitch(sf, text="Export .SRT", variable=self.export_srt).grid(row=2, column=1, padx=10, pady=5, sticky="w")
 
+        if self.runtime_mgr.has_gpu() and not self.runtime_mgr.gpu_ready():
+            self.gpu_btn = ctk.CTkButton(
+                sf, text="Enable GPU Acceleration (~1 GB)",
+                fg_color="#4CAF50", hover_color="#388E3C",
+                command=self._install_gpu,
+            )
+            self.gpu_btn.grid(row=3, column=0, columnspan=2, padx=10, pady=8, sticky="w")
+
         # Transcript
         tx_frame = ctk.CTkFrame(self, fg_color="transparent")
         tx_frame.grid(row=5, column=0, padx=20, pady=(10, 20), sticky="nsew")
@@ -839,32 +891,35 @@ class AudioWhisperApp(TkinterDnD_CTk):
             ctk.set_appearance_mode("Dark")
             self.visualizer.configure(bg="#2B2B2B")
 
+    @staticmethod
+    def _format_size(size_bytes):
+        if size_bytes >= 1024 ** 3:
+            return f"{size_bytes / (1024**3):.1f} GB"
+        if size_bytes >= 1024 ** 2:
+            return f"{size_bytes / (1024**2):.1f} MB"
+        return f"{size_bytes / 1024:.0f} KB"
+
+    @staticmethod
+    def _format_duration(dur):
+        if dur >= 3600:
+            return f"{int(dur // 3600)}h {int((dur % 3600) // 60)}m"
+        if dur >= 60:
+            return f"{int(dur // 60)}m {int(dur % 60)}s"
+        return f"{int(dur)}s"
+
     def _load_file(self, path):
         """Load a file into the UI, resetting previous state."""
+        if self.is_transcribing:
+            self.status_msg.set("Stop the current transcription before loading a new file.")
+            return
         self.input_path.set(path)
 
-        # Compute file info for the drop zone
-        file_info = ""
         try:
-            size_bytes = os.path.getsize(path)
-            if size_bytes >= 1024 * 1024 * 1024:
-                size_str = f"{size_bytes / (1024**3):.1f} GB"
-            elif size_bytes >= 1024 * 1024:
-                size_str = f"{size_bytes / (1024**2):.1f} MB"
-            else:
-                size_str = f"{size_bytes / 1024:.0f} KB"
-            dur = librosa.get_duration(path=path)
-            if dur >= 3600:
-                dur_str = f"{int(dur // 3600)}h {int((dur % 3600) // 60)}m"
-            elif dur >= 60:
-                dur_str = f"{int(dur // 60)}m {int(dur % 60)}s"
-            else:
-                dur_str = f"{int(dur)}s"
-            file_info = f"{dur_str}  |  {size_str}"
+            size_str = self._format_size(os.path.getsize(path))
         except Exception:
-            pass
+            size_str = ""
+        self.drop_zone.set_file(path, info=size_str)
 
-        self.drop_zone.set_file(path, info=file_info)
         # Reset progress from previous transcription
         self.progress_val.set(0)
         self.progress_bar.set(0)
@@ -876,13 +931,55 @@ class AudioWhisperApp(TkinterDnD_CTk):
         self.transcript_box.delete("1.0", "end")
         self.transcript_box.insert("1.0", "Your transcription will appear here.\n")
         self.transcript_box.configure(state="disabled")
-        # Load waveform
-        threading.Thread(target=self.visualizer.load_audio, args=(path,), daemon=True).start()
+
+        # Probe duration + waveform in the background (via the runtime)
+        threading.Thread(
+            target=self._probe_file, args=(path, size_str), daemon=True).start()
+
+    def _probe_file(self, path, size_str):
+        """Get duration + waveform peaks using the bundled runtime's PyAV."""
+        if not self.runtime_mgr.runtime_ok():
+            return
+        try:
+            result = subprocess.run(
+                [self.runtime_mgr.python_exe, _resource_path("media_probe.py"),
+                 path, str(self.visualizer.bars)],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=60, env=self.runtime_mgr.worker_env(),
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            data = json.loads(result.stdout)
+        except Exception:
+            return
+
+        duration = data.get("duration") or 0
+        peaks = data.get("peaks") or []
+
+        def apply():
+            if self.input_path.get() != path:
+                return  # user loaded a different file meanwhile
+            if duration:
+                info = f"{self._format_duration(duration)}  |  {size_str}" if size_str \
+                    else self._format_duration(duration)
+                self.drop_zone.set_file(path, info=info)
+            if peaks:
+                self.visualizer.set_amplitudes(peaks)
+
+        self.after(0, apply)
 
     def _drop_file(self, event):
-        path = event.data
+        # tkinterdnd2 delivers multi-file drops as a Tcl list — take the first
+        try:
+            paths = self.tk.splitlist(event.data)
+        except Exception:
+            paths = [event.data]
+        if not paths:
+            return
+        path = paths[0]
         if path.startswith("{") and path.endswith("}"):
             path = path[1:-1]
+        if len(paths) > 1:
+            self.status_msg.set("One file at a time — loaded the first one.")
         self._load_file(path)
 
     def _browse_input(self):
@@ -912,8 +1009,10 @@ class AudioWhisperApp(TkinterDnD_CTk):
 
     def _on_close(self):
         self._save_settings()
-        if self._worker_proc and self._worker_proc.poll() is None:
-            self._worker_proc.terminate()
+        proc = self._worker_proc
+        if proc and proc.poll() is None:
+            proc.terminate()
+        self.runtime_mgr.kill_pip()
         self.destroy()
 
     # ── Logging ─────────────────────────────────────────
@@ -940,18 +1039,11 @@ class AudioWhisperApp(TkinterDnD_CTk):
             messagebox.showwarning(APP_NAME, "Please select a file first.")
             return
 
-        # Ensure deps are installed
-        if not self.dep_manager.is_installed():
-            self._install_deps()
-            if not self.dep_manager.is_installed():
-                return
-
-        # Check FFmpeg for video files
-        is_video = self.input_path.get().lower().endswith((".mp4", ".avi", ".mov", ".mkv", ".webm"))
-        if is_video and not check_ffmpeg():
-            messagebox.showwarning(
+        if not self.runtime_mgr.runtime_ok():
+            messagebox.showerror(
                 APP_NAME,
-                "FFmpeg is required for video files.\nInstall it: winget install ffmpeg",
+                "The AudioWhisper runtime folder is missing.\n"
+                "Please reinstall AudioWhisper to fix this.",
             )
             return
 
@@ -971,15 +1063,16 @@ class AudioWhisperApp(TkinterDnD_CTk):
 
     def _run_worker(self):
         """Launch the transcription worker as a subprocess."""
-        python_exe = self.dep_manager.get_python_exe()
-        worker_path = self.dep_manager.get_worker_path()
+        use_gpu = self.runtime_mgr.gpu_ready() and self.runtime_mgr.has_gpu()
+        device = "cuda" if use_gpu else "cpu"
+        compute_type = "float16" if use_gpu else "int8"
 
         cmd = [
-            python_exe, worker_path,
+            self.runtime_mgr.python_exe, _resource_path("transcribe_worker.py"),
             "--input", self.input_path.get(),
             "--model", self.model_name.get(),
-            "--device", self.device,
-            "--compute_type", self.compute_type,
+            "--device", device,
+            "--compute_type", compute_type,
         ]
         if self.output_dir.get():
             cmd.extend(["--output_dir", self.output_dir.get()])
@@ -988,12 +1081,26 @@ class AudioWhisperApp(TkinterDnD_CTk):
         if self.export_srt.get():
             cmd.append("--export_srt")
 
+        stderr_lines = []
         try:
             self._worker_proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, bufsize=1,
+                text=True, encoding="utf-8", errors="replace", bufsize=1,
+                env=self.runtime_mgr.worker_env(),
                 creationflags=subprocess.CREATE_NO_WINDOW,
             )
+
+            # Drain stderr on a separate thread so a chatty worker can't
+            # fill the pipe and deadlock both processes
+            def _drain(pipe):
+                try:
+                    for l in pipe:
+                        stderr_lines.append(l.rstrip())
+                except Exception:
+                    pass
+
+            threading.Thread(
+                target=_drain, args=(self._worker_proc.stderr,), daemon=True).start()
 
             for line in self._worker_proc.stdout:
                 if self.stop_event.is_set():
@@ -1010,44 +1117,47 @@ class AudioWhisperApp(TkinterDnD_CTk):
                 except json.JSONDecodeError:
                     continue
 
-                msg_type = msg.get("type")
-                if msg_type == "status":
-                    self._log(msg["msg"])
-                elif msg_type == "model_download":
-                    self._log(msg.get("msg", "Downloading model..."))
-                    self.time_remaining_msg.set(f"{int(msg.get('value', 0) * 100)}%")
-                elif msg_type == "segment":
-                    self._log(f"{msg['timestamp']} {msg['text']}", is_transcript=True)
-                elif msg_type == "progress":
-                    self.progress_val.set(msg["value"])
-                    self.visualizer.set_progress(msg["value"])
-                    if msg.get("eta"):
-                        self.time_remaining_msg.set(msg["eta"])
-                elif msg_type == "done":
-                    self._log(msg["msg"])
-                    self.progress_val.set(1.0)
-                    self.visualizer.set_progress(1.0)
-                    self.time_remaining_msg.set("Complete")
-                    self.open_folder_btn.configure(state="normal")
-                elif msg_type == "error":
-                    self._log(f"Error: {msg['msg']}")
+                # All UI mutations happen on the main thread
+                self.after(0, lambda m=msg: self._handle_worker_msg(m))
 
             self._worker_proc.wait()
 
-            # If the worker crashed, show stderr
-            if self._worker_proc.returncode and self._worker_proc.returncode != 0:
-                stderr_output = self._worker_proc.stderr.read().strip()
-                if stderr_output:
-                    # Show the last meaningful line
-                    last_lines = stderr_output.strip().splitlines()[-3:]
-                    self._log(f"Error: {' | '.join(last_lines)}")
+            # If the worker crashed, show its last stderr lines
+            if self._worker_proc.returncode and not self.stop_event.is_set():
+                tail = [l for l in stderr_lines if l.strip()][-3:]
+                if tail:
+                    self._log(f"Error: {' | '.join(tail)}")
 
         except Exception as e:
             self._log(f"Error: {e}")
         finally:
             self._worker_proc = None
             self.is_transcribing = False
-            self._update_ui_state(transcribing=False)
+            self.after(0, lambda: self._update_ui_state(transcribing=False))
+
+    def _handle_worker_msg(self, msg):
+        """Process one worker JSON message (main thread only)."""
+        msg_type = msg.get("type")
+        if msg_type == "status":
+            self.status_msg.set(msg["msg"])
+        elif msg_type == "model_download":
+            self.status_msg.set(msg.get("msg", "Downloading model..."))
+            self.time_remaining_msg.set(f"{int(msg.get('value', 0) * 100)}%")
+        elif msg_type == "segment":
+            self._log(f"{msg['timestamp']} {msg['text']}", is_transcript=True)
+        elif msg_type == "progress":
+            self.progress_val.set(msg["value"])
+            self.visualizer.set_progress(msg["value"])
+            if msg.get("eta"):
+                self.time_remaining_msg.set(msg["eta"])
+        elif msg_type == "done":
+            self.status_msg.set(msg["msg"])
+            self.progress_val.set(1.0)
+            self.visualizer.set_progress(1.0)
+            self.time_remaining_msg.set("Complete")
+            self.open_folder_btn.configure(state="normal")
+        elif msg_type == "error":
+            self.status_msg.set(f"Error: {msg['msg']}")
 
     def _stop_transcription(self):
         if self.is_transcribing:
@@ -1056,8 +1166,9 @@ class AudioWhisperApp(TkinterDnD_CTk):
             ):
                 return
             self.stop_event.set()
-            if self._worker_proc and self._worker_proc.poll() is None:
-                self._worker_proc.terminate()
+            proc = self._worker_proc
+            if proc and proc.poll() is None:
+                proc.terminate()
 
     def _update_ui_state(self, transcribing):
         if transcribing:

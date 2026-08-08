@@ -1,6 +1,9 @@
 """
-Transcription worker — runs in the embedded Python environment.
+Transcription worker — runs in the bundled Python runtime.
 Communicates with the GUI via JSON lines on stdout.
+
+Audio/video decoding is handled by faster-whisper's bundled PyAV,
+which ships its own FFmpeg libraries — no system FFmpeg needed.
 
 Usage:
     python transcribe_worker.py --input FILE --model MODEL --device DEVICE
@@ -11,12 +14,30 @@ import os
 import json
 import time
 import argparse
+import itertools
+
+# Keep models inside AudioWhisper's data folder (GUI sets this; default for CLI use)
+os.environ.setdefault("HF_HOME", os.path.join(
+    os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "AudioWhisper", "models"))
+# Force the classic HTTP download path so the cache directory grows
+# linearly — that's how we measure model download progress
+os.environ["HF_HUB_DISABLE_XET"] = "1"
+
+# JSON messages must survive non-ASCII transcripts regardless of console codepage
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 
 def emit(msg_type, **kwargs):
-    """Send a JSON message to the parent process."""
+    """Send a JSON message to the parent process.
+
+    Single atomic write — the download watcher thread emits concurrently
+    with the main thread, and print() would interleave its two writes.
+    """
     kwargs["type"] = msg_type
-    print(json.dumps(kwargs, ensure_ascii=False), flush=True)
+    sys.stdout.write(json.dumps(kwargs, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
 
 
 # ── Model Download with Progress ───────────────────────
@@ -30,9 +51,31 @@ MODEL_REPOS = {
     "large-v3": "Systran/faster-whisper-large-v3",
 }
 
+# Approximate repo download sizes in MB (dominated by model.bin) —
+# used to compute progress while the cache directory fills up
+MODEL_SIZES_MB = {
+    "tiny": 76,
+    "base": 145,
+    "small": 484,
+    "medium": 1528,
+    "large-v3": 3087,
+}
+
+
+def _dir_size(path):
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(root, f))
+            except OSError:
+                pass
+    return total
+
 
 def _ensure_model_downloaded(model_name):
     """Download the model with progress reporting, return the cache path."""
+    import threading
     from huggingface_hub import snapshot_download, scan_cache_dir
     import huggingface_hub
 
@@ -41,31 +84,40 @@ def _ensure_model_downloaded(model_name):
         # Unknown model — let faster-whisper handle it
         return model_name
 
-    # Check if already cached
+    cache_dir = huggingface_hub.constants.HF_HUB_CACHE
+
+    # Check if already cached — and actually complete. An interrupted
+    # download leaves the small files (config.json etc.) in place, so
+    # require model.bin before trusting the cache; otherwise fall through
+    # to snapshot_download, which resumes partial downloads.
     try:
-        cache_dir = huggingface_hub.constants.HF_HUB_CACHE
         cache_info = scan_cache_dir(cache_dir)
         for repo in cache_info.repos:
             if repo.repo_id == repo_id and repo.size_on_disk > 0:
-                # Already downloaded — find the snapshot path
                 for revision in repo.revisions:
-                    return str(revision.snapshot_path)
+                    snap = str(revision.snapshot_path)
+                    if os.path.isfile(os.path.join(snap, "model.bin")):
+                        return snap
     except Exception:
         pass
 
-    # Download with progress
     emit("status", msg=f"Downloading {model_name} model...")
 
-    last_report = [0.0]
+    # Report progress by watching the repo's cache folder grow. This works
+    # regardless of how huggingface_hub downloads internally.
+    expected = MODEL_SIZES_MB.get(model_name, 0) * 1024 * 1024
+    repo_dir = os.path.join(cache_dir, "models--" + repo_id.replace("/", "--"))
+    stop_watch = threading.Event()
 
-    def _progress_callback(current, total):
-        if total and total > 0:
-            pct = current / total
-            # Only report every 2% to avoid flooding
-            if pct - last_report[0] >= 0.02 or pct >= 1.0:
-                last_report[0] = pct
-                mb_done = current / (1024 * 1024)
-                mb_total = total / (1024 * 1024)
+    def _watch():
+        last_pct = -1.0
+        while not stop_watch.wait(0.5):
+            done = _dir_size(repo_dir)
+            pct = min(done / expected, 0.99)
+            if pct - last_pct >= 0.01:
+                last_pct = pct
+                mb_done = done / (1024 * 1024)
+                mb_total = expected / (1024 * 1024)
                 if mb_total >= 1024:
                     emit("model_download", value=pct,
                          msg=f"Downloading {model_name} model: {mb_done / 1024:.1f} / {mb_total / 1024:.1f} GB")
@@ -73,53 +125,27 @@ def _ensure_model_downloaded(model_name):
                     emit("model_download", value=pct,
                          msg=f"Downloading {model_name} model: {mb_done:.0f} / {mb_total:.0f} MB")
 
-    # Try using tqdm callback for progress
-    try:
-        from huggingface_hub.utils import tqdm as hf_tqdm
-        import tqdm as tqdm_module
+    watcher = None
+    if expected > 0:
+        watcher = threading.Thread(target=_watch, daemon=True)
+        watcher.start()
 
-        original_init = tqdm_module.tqdm.__init__
-        original_update = tqdm_module.tqdm.update
-        _bars = {}
-
-        class ProgressTracker:
-            def __init__(self):
-                self.total = 0
-                self.current = 0
-
-        tracker = ProgressTracker()
-
-        def patched_init(self_tqdm, *args, **kwargs):
-            original_init(self_tqdm, *args, **kwargs)
-            if hasattr(self_tqdm, 'total') and self_tqdm.total and self_tqdm.total > 1024 * 1024:
-                tracker.total = self_tqdm.total
-                tracker.current = 0
-
-        def patched_update(self_tqdm, n=1):
-            original_update(self_tqdm, n)
-            if tracker.total > 0:
-                tracker.current += n
-                _progress_callback(tracker.current, tracker.total)
-
-        tqdm_module.tqdm.__init__ = patched_init
-        tqdm_module.tqdm.update = patched_update
-    except Exception:
-        pass
+    def _stop_watcher():
+        stop_watch.set()
+        if watcher:
+            watcher.join(timeout=2)
 
     try:
         path = snapshot_download(repo_id)
+        _stop_watcher()
+        emit("model_download", value=1.0, msg=f"Model {model_name} ready")
         emit("status", msg=f"Model {model_name} ready")
         return path
     except Exception as e:
         emit("status", msg=f"Model download issue, trying fallback: {e}")
         return model_name
     finally:
-        # Restore tqdm
-        try:
-            tqdm_module.tqdm.__init__ = original_init
-            tqdm_module.tqdm.update = original_update
-        except Exception:
-            pass
+        _stop_watcher()
 
 
 # ── VRAM Detection ─────────────────────────────────────
@@ -151,7 +177,7 @@ def _check_vram(model_name, device):
             if required > 0 and free_mb < required:
                 emit("status",
                      msg=f"Warning: {model_name} needs ~{required // 1000}GB VRAM, "
-                         f"but only {free_mb // 1000:.1f}GB free. May fall back to CPU.")
+                         f"but only {free_mb / 1000:.1f}GB free. Will use CPU if needed.")
     except Exception:
         pass
 
@@ -163,7 +189,7 @@ def main():
     parser.add_argument("--input", required=True)
     parser.add_argument("--model", default="base")
     parser.add_argument("--device", default="cpu")
-    parser.add_argument("--compute_type", default="float32")
+    parser.add_argument("--compute_type", default="int8")
     parser.add_argument("--output_dir", default="")
     parser.add_argument("--timestamps", action="store_true")
     parser.add_argument("--export_srt", action="store_true")
@@ -177,7 +203,6 @@ def main():
         emit("status", msg="Preparing model...")
 
         from faster_whisper import WhisperModel
-        import librosa
 
         # Check VRAM before downloading/loading
         _check_vram(args.model, args.device)
@@ -185,44 +210,45 @@ def main():
         # Download model with progress (if needed)
         model_path = _ensure_model_downloaded(args.model)
 
-        emit("status", msg="Loading model...")
-
-        # Prepare audio
-        total_duration = 0
-        process_file = input_file
-        temp_file = None
-
-        is_video = input_file.lower().endswith((".mp4", ".avi", ".mov", ".mkv", ".webm"))
-        if is_video:
-            emit("status", msg="Extracting audio from video...")
-            import ffmpeg
-            temp_file = os.path.splitext(input_file)[0] + "_temp.wav"
-            (
-                ffmpeg.input(input_file)
-                .output(temp_file, format="wav", acodec="pcm_s16le", ac=1, ar="16000")
-                .overwrite_output()
-                .run(quiet=True)
-            )
-            process_file = temp_file
-
-        try:
-            total_duration = librosa.get_duration(path=process_file)
-        except Exception:
-            total_duration = 0
-
-        model = WhisperModel(model_path, device=args.device, compute_type=args.compute_type)
-
         # Adaptive beam size: smaller models use fewer beams for speed
         BEAM_SIZES = {"tiny": 1, "base": 3, "small": 3, "medium": 5, "large-v3": 5}
         beam_size = args.beam_size if args.beam_size > 0 else BEAM_SIZES.get(args.model, 5)
 
-        emit("status", msg="Transcribing...")
-        segments, info = model.transcribe(process_file, beam_size=beam_size)
+        emit("status", msg="Loading model...")
+
+        def _start(device, compute_type):
+            model = WhisperModel(model_path, device=device, compute_type=compute_type)
+            emit("status", msg="Transcribing...")
+            segments, info = model.transcribe(input_file, beam_size=beam_size)
+            seg_iter = iter(segments)
+            # Pull the first segment now so CUDA failures surface here,
+            # where we can still fall back to CPU
+            first = next(seg_iter, None)
+            return first, seg_iter, info
+
+        # Fall back to CPU outside the except block so the failed CUDA
+        # model (pinned by the in-flight exception's traceback) is freed
+        # before the CPU model loads
+        fallback = False
+        try:
+            first, seg_iter, info = _start(args.device, args.compute_type)
+        except Exception:
+            if args.device != "cuda":
+                raise
+            fallback = True
+        if fallback:
+            emit("status", msg="GPU unavailable — switching to CPU...")
+            first, seg_iter, info = _start("cpu", "int8")
+
+        # PyAV decodes the full audio up front, so info.duration covers
+        # both audio and video inputs — no FFmpeg or librosa needed
+        total_duration = getattr(info, "duration", 0) or 0
 
         collected_segments = []
         start_time = time.time()
 
-        for segment in segments:
+        segments_all = itertools.chain([first], seg_iter) if first is not None else seg_iter
+        for segment in segments_all:
             # Progress & ETA
             if total_duration > 0:
                 prog = min(segment.end / total_duration, 1.0)
@@ -267,9 +293,6 @@ def main():
 
     except Exception as e:
         emit("error", msg=str(e))
-    finally:
-        if temp_file and os.path.exists(temp_file):
-            os.remove(temp_file)
 
 
 def _format_srt_time(seconds):

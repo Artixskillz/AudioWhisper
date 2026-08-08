@@ -19,6 +19,9 @@ settings.json
 # Installer output
 installer_output/
 
+# Build cache (downloaded Python embed + get-pip)
+build_cache/
+
 # Generated
 generate_icon.py
 version_info.txt
