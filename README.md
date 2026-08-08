@@ -1,65 +1,44 @@
 # AudioWhisper
 
-**Free, private, offline transcription for audio and video files.**
+Free offline transcription for Windows. Drop in an audio or video file and get a text transcript. Everything runs on your own machine, so nothing gets uploaded anywhere and there's no account or subscription.
 
-AudioWhisper turns your spoken words into text — entirely on your own computer. Nothing is uploaded, no account is needed, and no extra software is required.
-
-Powered by OpenAI's [Whisper](https://github.com/openai/whisper) model via [faster-whisper](https://github.com/SYSTRAN/faster-whisper) for maximum speed.
-
----
+Built on OpenAI's [Whisper](https://github.com/openai/whisper) model, running through [faster-whisper](https://github.com/SYSTRAN/faster-whisper).
 
 ## Download
 
-**[Download the latest installer from Releases](https://github.com/Artixskillz/AudioWhisper/releases/latest)**
+Grab the installer from the [Releases page](https://github.com/Artixskillz/AudioWhisper/releases/latest). Install it, open the app, drop a file in. There's nothing else to set up.
 
-Run the installer, launch the app, and start transcribing. That's it — everything the app needs is included. No terminal, no Python, no FFmpeg to install.
+Windows SmartScreen might warn you the first time because the installer isn't code-signed yet. Click "More info" and then "Run anyway".
 
-> **Note:** Windows SmartScreen may warn about an unrecognized app (the installer isn't code-signed yet). Click **More info → Run anyway** to continue.
+## What it does
 
----
+- Transcribes audio and video files. Video works out of the box, no FFmpeg or anything else to install.
+- Shows the transcript live while it works, with a waveform and time remaining.
+- Five model sizes, from tiny (fast but rough) to large-v3 (slow but very accurate).
+- Saves .txt transcripts and optional .srt subtitle files, with or without timestamps.
+- Dark and light mode.
+- If you have an NVIDIA card, one click turns on GPU acceleration. It's about a 1 GB download and makes transcription 5-10x faster. CPU works fine without it.
 
-## Features
+## Formats
 
-- **Drag & drop** any audio or video file to transcribe it
-- **Fully self-contained** — video and audio decoding is built in, no FFmpeg needed
-- **Optional GPU acceleration** — one click enables your NVIDIA GPU for 5-10x faster transcription
-- **Multiple models** — from fast/rough (`tiny`) to slow/accurate (`large-v3`)
-- **Subtitle export** — generate `.srt` files for YouTube, Premiere, VLC, etc.
-- **Timestamps** — optional time markers in the transcript
-- **Live transcript & waveform** — watch the text appear with visual progress
-- **Dark & light mode** — switch with one click
-- **Private** — everything runs locally, nothing leaves your machine
-
-## Supported Formats
-
-**Audio:** MP3, WAV, M4A, FLAC, OGG, WMA, AAC
-**Video:** MP4, AVI, MOV, MKV, WebM
+MP3, WAV, M4A, FLAC, OGG, WMA, AAC, MP4, AVI, MOV, MKV, WebM
 
 ## Requirements
 
-- **Windows 10/11** (64-bit)
-- ~1 GB of disk space (plus the model size you choose)
-- **Optional:** NVIDIA GPU (RTX 20/30/40/50 series) for faster transcription
+Windows 10 or 11, 64-bit. About 1 GB of disk space plus whatever model size you pick. That's it.
 
-## How It Works
+## How it works
 
-1. **Install** — run the installer from the Releases page. The complete transcription engine ships inside it.
-2. **Drop a file** — drag an audio or video file into the app (or click to browse)
-3. **Transcribe** — hit Start and watch the live transcript appear
-4. **Save** — output is saved as a `.txt` file (and `.srt` if enabled)
+The installer ships with its own Python runtime and the complete transcription engine, so nothing downloads during install. The first time you transcribe, the app fetches the Whisper model you picked (145 MB for base, up to 3 GB for large-v3) and shows a progress bar while it does. After that everything works fully offline.
 
-The first time you transcribe, the app downloads your chosen Whisper model with a progress bar (~145 MB for `base`, up to ~3 GB for `large-v3`). After that, transcription works completely offline.
-
-If you have an NVIDIA GPU, the app offers one-click GPU acceleration (a one-time ~1 GB download). CPU transcription works out of the box either way.
-
-## Building from Source
+## Building from source
 
 ```bash
 pip install pyinstaller customtkinter tkinterdnd2
 python build.py
 ```
 
-`build.py` builds the GUI, assembles the bundled Python runtime with the transcription engine, and compiles the installer (requires [Inno Setup 6](https://jrsoftware.org/isinfo.php)). The finished setup lands in `installer_output/`.
+That builds the GUI, assembles the bundled runtime, and compiles the installer. You'll need [Inno Setup 6](https://jrsoftware.org/isinfo.php) for the last step. The finished setup lands in `installer_output/`.
 
 ## License
 
