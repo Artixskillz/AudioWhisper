@@ -36,6 +36,10 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
+; Only shown on machines with an NVIDIA GPU; checked by default. The app
+; downloads the CUDA libraries (~1 GB) with a progress bar on first launch.
+; Other GPUs (AMD/Intel) need nothing - the Vulkan engine ships built in.
+Name: "gpumax"; Description: "Maximum GPU performance (downloads ~1 GB of NVIDIA libraries on first launch)"; Check: HasNvidiaGpu
 
 [InstallDelete]
 ; Upgrades must not merge stale files from the previous version into the
@@ -56,6 +60,7 @@ Source: "dist\AudioWhisper\*"; DestDir: "{app}"; Flags: ignoreversion recursesub
 ; No user data lives here; models and settings are under {localappdata}.
 Type: filesandordirs; Name: "{app}\_internal"
 Type: filesandordirs; Name: "{app}\runtime"
+Type: files; Name: "{app}\gpu_auto.flag"
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
@@ -66,6 +71,21 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: de
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: nowait postinstall skipifsilent
 
 [Code]
+function HasNvidiaGpu: Boolean;
+begin
+  Result := FileExists(ExpandConstant('{sys}\nvml.dll')) or
+            FileExists(ExpandConstant('{sys}\nvidia-smi.exe'));
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssPostInstall then
+  begin
+    if WizardIsTaskSelected('gpumax') then
+      SaveStringToFile(ExpandConstant('{app}\gpu_auto.flag'), 'auto', False);
+  end;
+end;
+
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   if CurUninstallStep = usPostUninstall then

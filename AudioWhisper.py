@@ -18,7 +18,7 @@ from tkinterdnd2 import DND_FILES, TkinterDnD
 # ──────────────────────────────────────────────────────────
 
 APP_NAME = "AudioWhisper"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 
 MODELS = {
     "tiny":     "Fastest — low accuracy, good for quick drafts (75 MB)",
@@ -103,7 +103,58 @@ class RuntimeManager:
         self.is_bundled = self.python_dir == candidates[0]
         self.gpu_marker = os.path.join(app_data_dir, "gpu_installed.json")
         self.install_log = os.path.join(app_data_dir, "install.log")
+        self.whispercpp_dir = os.path.join(self.python_dir, "whispercpp")
+        self.gpu_auto_flag = os.path.join(_exe_dir(), "gpu_auto.flag")
+        self._gpu_names = None  # filled by detect_gpus_async
         self._pip_proc = None
+
+    # ── GPU detection ───────────────────────────────────
+
+    def detect_gpus_async(self, on_done=None):
+        """Enumerate display adapters in the background (WMI is slow)."""
+        def _detect():
+            names = []
+            try:
+                r = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command",
+                     "Get-CimInstance Win32_VideoController | "
+                     "Select-Object -ExpandProperty Name"],
+                    capture_output=True, text=True, timeout=15,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+                skip = ("basic display", "basic render", "remote", "virtual", "parsec")
+                names = [n.strip() for n in r.stdout.splitlines()
+                         if n.strip() and not any(s in n.lower() for s in skip)]
+            except Exception:
+                pass
+            self._gpu_names = names
+            if on_done:
+                on_done()
+
+        threading.Thread(target=_detect, daemon=True).start()
+
+    def vulkan_available(self):
+        """whisper.cpp Vulkan engine works on any real GPU (AMD/Intel/NVIDIA)."""
+        return (bool(self._gpu_names)
+                and os.path.isfile(os.path.join(self.whispercpp_dir, "whisper-cli.exe")))
+
+    def pick_backend(self):
+        """Best available engine: CUDA > Vulkan > CPU."""
+        if self.gpu_ready() and self.has_gpu():
+            return "cuda"
+        if self.vulkan_available():
+            return "vulkan"
+        return "cpu"
+
+    def consume_auto_flag(self):
+        """Installer task marker: auto-start the CUDA download on first launch."""
+        if os.path.exists(self.gpu_auto_flag):
+            try:
+                os.remove(self.gpu_auto_flag)
+            except OSError:
+                pass
+            return True
+        return False
 
     def kill_pip(self):
         """Kill any in-flight pip install (called on app close)."""
@@ -421,7 +472,7 @@ class GpuInstallDialog(ctk.CTkToplevel):
 
         ctk.CTkLabel(
             self,
-            text="Downloading NVIDIA CUDA libraries (~1 GB).\nThis only happens once — transcription will be 5-10x faster.",
+            text="Downloading NVIDIA CUDA libraries (~1 GB).\nThis only happens once and unlocks the fastest engine.",
             font=("Segoe UI", 12), text_color="gray60", justify="center",
         ).pack(pady=(0, 20))
 
@@ -544,11 +595,11 @@ class SetupDialog(ctk.CTkToplevel):
         if offer_gpu:
             ctk.CTkCheckBox(
                 self,
-                text="Enable GPU acceleration (~1 GB download, 5-10x faster)",
+                text="Maximum GPU performance (NVIDIA, ~1 GB download)",
                 variable=self.gpu_var, font=("Segoe UI", 12, "bold"),
             ).pack(pady=(5, 5))
             ctk.CTkLabel(
-                self, text="NVIDIA GPU detected — recommended",
+                self, text="NVIDIA GPU detected — recommended for the best speed",
                 font=("Segoe UI", 11), text_color="#4CAF50",
             ).pack()
 
@@ -636,6 +687,9 @@ class AudioWhisperApp(TkinterDnD_CTk):
         # Build UI
         self._create_widgets()
         self._refresh_device_label()
+        # GPU enumeration is slow (WMI) — do it off-thread, then update the label
+        self.runtime_mgr.detect_gpus_async(
+            on_done=lambda: self.after(0, self._refresh_device_label))
 
         # Drag & drop
         self.drop_target_register(DND_FILES)
@@ -648,6 +702,7 @@ class AudioWhisperApp(TkinterDnD_CTk):
         if not self.settings.get("setup_complete"):
             self.after(200, self._show_setup)
         else:
+            self.after(600, self._check_gpu_auto_flag)
             self.after(1000, self._offer_legacy_cleanup)
 
         # Sanity check: the runtime ships with the installer
@@ -693,10 +748,20 @@ class AudioWhisperApp(TkinterDnD_CTk):
             self.model_name.set(dialog.result["model"])
         self._save_settings()
 
-        if dialog.result and dialog.result.get("install_gpu"):
+        # Install the CUDA pack if the user asked in the dialog, or if the
+        # installer's "maximum GPU performance" task was left checked
+        auto = self.runtime_mgr.consume_auto_flag()
+        if (dialog.result and dialog.result.get("install_gpu")) or \
+                (auto and offer_gpu):
             self._install_gpu()
 
         self._offer_legacy_cleanup()
+
+    def _check_gpu_auto_flag(self):
+        """Upgrade installs skip the setup dialog but may carry the task flag."""
+        auto = self.runtime_mgr.consume_auto_flag()
+        if auto and self.runtime_mgr.has_gpu() and not self.runtime_mgr.gpu_ready():
+            self._install_gpu()
 
     def _install_gpu(self):
         dialog = GpuInstallDialog(self, self.runtime_mgr)
@@ -745,15 +810,16 @@ class AudioWhisperApp(TkinterDnD_CTk):
         threading.Thread(target=_cleanup, daemon=True).start()
 
     def _refresh_device_label(self):
-        # Same predicate _run_worker uses to pick the device
-        if self.runtime_mgr.gpu_ready() and self.runtime_mgr.has_gpu():
+        # Same predicate _run_worker uses to pick the engine
+        backend = self.runtime_mgr.pick_backend()
+        if backend != "cpu":
             self.device_label_var.set("GPU")
             self.device_label.configure(text_color="#4CAF50")
-            if hasattr(self, "gpu_btn"):
-                self.gpu_btn.grid_remove()
         else:
             self.device_label_var.set("CPU")
             self.device_label.configure(text_color="#FF9800")
+        if backend == "cuda" and hasattr(self, "gpu_btn"):
+            self.gpu_btn.grid_remove()
 
     # ── UI ──────────────────────────────────────────────
 
@@ -850,7 +916,7 @@ class AudioWhisperApp(TkinterDnD_CTk):
 
         if self.runtime_mgr.has_gpu() and not self.runtime_mgr.gpu_ready():
             self.gpu_btn = ctk.CTkButton(
-                sf, text="Enable GPU Acceleration (~1 GB)",
+                sf, text="Maximum GPU Performance (NVIDIA, ~1 GB)",
                 fg_color="#4CAF50", hover_color="#388E3C",
                 command=self._install_gpu,
             )
@@ -1063,16 +1129,14 @@ class AudioWhisperApp(TkinterDnD_CTk):
 
     def _run_worker(self):
         """Launch the transcription worker as a subprocess."""
-        use_gpu = self.runtime_mgr.gpu_ready() and self.runtime_mgr.has_gpu()
-        device = "cuda" if use_gpu else "cpu"
-        compute_type = "float16" if use_gpu else "int8"
+        backend = self.runtime_mgr.pick_backend()
 
         cmd = [
             self.runtime_mgr.python_exe, _resource_path("transcribe_worker.py"),
             "--input", self.input_path.get(),
             "--model", self.model_name.get(),
-            "--device", device,
-            "--compute_type", compute_type,
+            "--backend", backend,
+            "--whispercpp_dir", self.runtime_mgr.whispercpp_dir,
         ]
         if self.output_dir.get():
             cmd.extend(["--output_dir", self.output_dir.get()])

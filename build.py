@@ -35,6 +35,10 @@ RUNTIME_PACKAGES = [
     "ctranslate2==4.8.1",
 ]
 
+# whisper.cpp Vulkan build (AMD/Intel/NVIDIA GPU support), compiled by the
+# build-whispercpp GitHub Actions workflow in this repo
+WHISPERCPP_ARTIFACT = "whispercpp-vulkan-win64-v1.9.2"
+
 ISCC_CANDIDATES = [
     os.path.expandvars(r"%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe"),
     r"C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
@@ -234,6 +238,32 @@ def build_runtime():
     print(f"  runtime size: {size / 1024**2:.0f} MB")
 
 
+def stage_whispercpp():
+    """Copy the whisper.cpp Vulkan build into the runtime (GPU support for
+    AMD/Intel, and NVIDIA without the CUDA pack)."""
+    dest = os.path.join(RUNTIME_DIR, "whispercpp")
+    if os.path.isfile(os.path.join(dest, "whisper-cli.exe")):
+        print("  whispercpp: already staged")
+        return
+
+    cache = os.path.join(CACHE_DIR, "whispercpp")
+    if not os.path.isfile(os.path.join(cache, "whisper-cli.exe")):
+        print(f"  downloading CI artifact {WHISPERCPP_ARTIFACT}...")
+        os.makedirs(cache, exist_ok=True)
+        r = subprocess.run(
+            ["gh", "run", "download", "--name", WHISPERCPP_ARTIFACT, "--dir", cache],
+            cwd=BASE_DIR, capture_output=True, text=True)
+        if r.returncode != 0 or not os.path.isfile(os.path.join(cache, "whisper-cli.exe")):
+            raise RuntimeError(
+                "whisper.cpp Vulkan binaries not found. Run the "
+                "build-whispercpp workflow first (gh workflow run "
+                f"build-whispercpp.yml) then retry.\n{r.stderr[-500:]}")
+
+    shutil.copytree(cache, dest)
+    size = sum(os.path.getsize(os.path.join(dest, f)) for f in os.listdir(dest))
+    print(f"  whispercpp staged ({size / 1024**2:.0f} MB)")
+
+
 def build_installer(version):
     print("\n[3/3] Compiling installer (Inno Setup)...")
     # Never ship a half-assembled app folder
@@ -265,6 +295,7 @@ def main():
         build_exe(version)
     if "--skip-runtime" not in args:
         build_runtime()
+    stage_whispercpp()
     if "--skip-installer" not in args:
         build_installer(version)
 
