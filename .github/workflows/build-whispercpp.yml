@@ -1,0 +1,53 @@
+# Builds whisper.cpp with the Vulkan backend for Windows.
+# Official whisper.cpp releases don't include a Vulkan build, and Vulkan is
+# what lets AudioWhisper use AMD and Intel GPUs (and NVIDIA without CUDA).
+# Run manually; download the artifact and stage it via build.py.
+
+name: build-whispercpp-vulkan
+
+on:
+  workflow_dispatch:
+    inputs:
+      whisper_ref:
+        description: "whisper.cpp tag to build"
+        default: "v1.9.2"
+        required: true
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - name: Clone whisper.cpp
+        run: |
+          git clone --depth 1 --branch ${{ github.event.inputs.whisper_ref }} https://github.com/ggml-org/whisper.cpp
+
+      - name: Install Vulkan SDK
+        run: |
+          curl.exe -o "$env:RUNNER_TEMP\vulkan-sdk.exe" -L "https://sdk.lunarg.com/sdk/download/1.4.309.0/windows/VulkanSDK-1.4.309.0-Installer.exe"
+          & "$env:RUNNER_TEMP\vulkan-sdk.exe" --accept-licenses --default-answer --confirm-command install
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\1.4.309.0"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\1.4.309.0\Bin"
+
+      - name: Configure
+        run: >
+          cmake -S whisper.cpp -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DGGML_VULKAN=ON
+          -DWHISPER_BUILD_TESTS=OFF
+          -DWHISPER_BUILD_EXAMPLES=ON
+
+      - name: Build
+        run: cmake --build build --config Release -j 4
+
+      - name: Collect binaries
+        run: |
+          New-Item -ItemType Directory dist_bin | Out-Null
+          Copy-Item build\bin\Release\whisper-cli.exe dist_bin\
+          Copy-Item build\bin\Release\*.dll dist_bin\
+          Get-ChildItem dist_bin
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: whispercpp-vulkan-win64-${{ github.event.inputs.whisper_ref }}
+          path: dist_bin/
